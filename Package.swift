@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "Litter",
+    name: "Mocode",
     platforms: [
         .iOS(.v26)
     ],
     products: [
-        .library(name: "Litter", targets: ["Litter"])
+        .library(name: "Mocode", targets: ["Mocode"])
     ],
     targets: [
         .binaryTarget(
@@ -15,9 +15,9 @@ let package = Package(
             path: "Frameworks/codex_bridge.xcframework"
         ),
         .target(
-            name: "Litter",
+            name: "Mocode",
             dependencies: ["codex_bridge"],
-            path: "Sources/Litter",
+            path: "Sources/Mocode",
             publicHeadersPath: "Bridge"
         )
     ]

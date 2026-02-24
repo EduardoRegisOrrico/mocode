@@ -1,0 +1,620 @@
+import SwiftUI
+import MarkdownUI
+import Inject
+
+struct MessageBubbleView: View {
+    @ObserveInjection var inject
+    let message: ChatMessage
+    @ScaledMetric(relativeTo: .body) private var mdBodySize: CGFloat = 14
+    @ScaledMetric(relativeTo: .footnote) private var mdCodeSize: CGFloat = 13
+    @ScaledMetric(relativeTo: .footnote) private var mdSystemBodySize: CGFloat = 13
+    @ScaledMetric(relativeTo: .caption2) private var mdSystemCodeSize: CGFloat = 12
+    @State private var expanded = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            if message.role == .user {
+                Spacer(minLength: 60)
+                userBubble
+            } else if message.role == .assistant {
+                assistantBubble
+                Spacer(minLength: 20)
+            } else if isReasoning {
+                reasoningContent
+                Spacer(minLength: 20)
+            } else {
+                systemBubble
+                Spacer(minLength: 20)
+            }
+        }
+        .enableInjection()
+    }
+
+    private var isReasoning: Bool {
+        let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("### ") else { return false }
+        let firstLine = trimmed.prefix(while: { $0 != "\n" })
+        return firstLine.lowercased().contains("reason")
+    }
+
+    private var userBubble: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            ForEach(message.images) { img in
+                if let uiImage = UIImage(data: img.data) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 200, maxHeight: 200)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.system(size: 16))
+                    .foregroundColor(.white)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(MocodeTheme.accent, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var assistantBubble: some View {
+        assistantContent
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+            )
+    }
+
+    private var assistantContent: some View {
+        let parsed = extractInlineImages(message.text)
+        return VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(parsed.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .text(let md):
+                    Markdown(md)
+                        .markdownTheme(.mocode(bodySize: mdBodySize, codeSize: mdCodeSize))
+                        .markdownCodeSyntaxHighlighter(.plain)
+                        .textSelection(.enabled)
+                case .imageData(let data):
+                    if let uiImage = UIImage(data: data) {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 300)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var reasoningContent: some View {
+        let (_, body) = extractSystemTitleAndBody(message.text)
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "brain.head.profile")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(MocodeTheme.textSecondary)
+                .padding(.top, 2)
+            Text(body)
+                .font(.system(size: 13))
+                .italic()
+                .foregroundColor(MocodeTheme.textSecondary)
+                .textSelection(.enabled)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var isToolCall: Bool {
+        let (title, _) = extractSystemTitleAndBody(message.text)
+        guard let t = title?.lowercased() else { return false }
+        return t.contains("command") || t.contains("file") || t.contains("mcp")
+            || t.contains("web") || t.contains("collab") || t.contains("image")
+    }
+
+    private var systemBubble: some View {
+        let (title, body) = extractSystemTitleAndBody(message.text)
+        let theme = systemTheme(for: title)
+        let toolCall = isToolCall
+        let summary = toolCall ? compactSummary(title: title, body: body) : nil
+
+        return VStack(alignment: .leading, spacing: 0) {
+            // Header row — always visible, tappable for tool calls
+            HStack(spacing: 6) {
+                Image(systemName: theme.icon)
+                    .font(.system(.caption2, weight: .semibold))
+                    .foregroundColor(theme.accent)
+                if toolCall, let summary {
+                    Text(summary)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundColor(MocodeTheme.textSystem)
+                        .lineLimit(1)
+                } else if let title {
+                    Text(title.uppercased())
+                        .font(.system(.caption2, design: .rounded, weight: .bold))
+                        .foregroundColor(theme.accent)
+                }
+                Spacer()
+                if toolCall {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(.caption2, weight: .medium))
+                        .foregroundColor(MocodeTheme.textMuted)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if toolCall { withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }
+            }
+
+            // Expanded body
+            if !toolCall || expanded {
+                Markdown(body)
+                    .markdownTheme(.mocodeSystem(bodySize: mdSystemBodySize, codeSize: mdSystemCodeSize))
+                    .markdownCodeSyntaxHighlighter(.plain)
+                    .textSelection(.enabled)
+                    .padding(.top, 8)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .glassEffect(.regular.tint(theme.accent.opacity(0.15)), in: .rect(cornerRadius: 12))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(theme.accent.opacity(0.9))
+                .frame(width: 3)
+                .padding(.vertical, 6)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func compactSummary(title: String?, body: String) -> String {
+        guard let title = title?.lowercased() else { return "" }
+        let lines = body.components(separatedBy: "\n")
+
+        if title.contains("command") {
+            // Extract command from the code block after "Command:"
+            if let cmdIdx = lines.firstIndex(where: { $0.hasPrefix("Command:") }),
+               cmdIdx + 2 < lines.count {
+                let cmd = lines[cmdIdx + 2] // line after ```bash
+                    .trimmingCharacters(in: .whitespaces)
+                // Strip shell wrapper
+                let short = cmd
+                    .replacingOccurrences(of: "/bin/zsh -lc '", with: "")
+                    .replacingOccurrences(of: "/bin/bash -lc '", with: "")
+                    .replacingOccurrences(of: "'", with: "")
+                let status = lines.first { $0.hasPrefix("Status:") }?
+                    .replacingOccurrences(of: "Status: ", with: "") ?? ""
+                let duration = lines.first { $0.contains("Duration:") }
+                    .flatMap { line -> String? in
+                        guard let range = line.range(of: "Duration: ") else { return nil }
+                        return String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                    }
+                var result = short
+                if status == "completed" { result += " ✓" }
+                else if !status.isEmpty { result += " (\(status))" }
+                if let d = duration { result += " \(d)" }
+                return result
+            }
+        }
+
+        if title.contains("file") {
+            let paths = lines.filter { $0.hasPrefix("Path: ") }
+                .map { $0.replacingOccurrences(of: "Path: ", with: "") }
+            if let first = paths.first {
+                let name = (first as NSString).lastPathComponent
+                if paths.count > 1 {
+                    return "\(name) +\(paths.count - 1) files"
+                }
+                return name
+            }
+        }
+
+        if title.contains("mcp") {
+            if let toolLine = lines.first(where: { $0.hasPrefix("Tool: ") }) {
+                let tool = toolLine.replacingOccurrences(of: "Tool: ", with: "")
+                let status = lines.first { $0.hasPrefix("Status:") }?
+                    .replacingOccurrences(of: "Status: ", with: "") ?? ""
+                if status == "completed" { return "\(tool) ✓" }
+                return "\(tool) (\(status))"
+            }
+        }
+
+        if title.contains("web") {
+            if let queryLine = lines.first(where: { $0.hasPrefix("Query: ") }) {
+                return queryLine.replacingOccurrences(of: "Query: ", with: "")
+            }
+        }
+
+        return title.capitalized
+    }
+
+    private func extractSystemTitleAndBody(_ text: String) -> (String?, String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("### ") else { return (nil, trimmed) }
+        let lines = trimmed.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let first = lines.first else { return (nil, trimmed) }
+        let title = first.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (title.isEmpty ? nil : title, body)
+    }
+
+    private func systemTheme(for title: String?) -> (accent: Color, icon: String) {
+        guard let title = title?.lowercased() else {
+            return (Color(hex: "#8CB3A4"), "info.circle.fill")
+        }
+        if title.contains("command") {
+            return (Color(hex: "#C7B072"), "terminal.fill")
+        }
+        if title.contains("file") {
+            return (Color(hex: "#7CAFD9"), "doc.text.fill")
+        }
+        if title.contains("mcp") {
+            return (Color(hex: "#C797D8"), "wrench.and.screwdriver.fill")
+        }
+        if title.contains("plan") {
+            return (Color(hex: "#9BCF8E"), "list.bullet.rectangle.portrait.fill")
+        }
+        if title.contains("reason") {
+            return (Color(hex: "#E3A66F"), "brain.head.profile")
+        }
+        if title.contains("web") {
+            return (Color(hex: "#88C6C7"), "globe")
+        }
+        if title.contains("review") {
+            return (Color(hex: "#D69696"), "checkmark.seal.fill")
+        }
+        if title.contains("context") {
+            return (Color(hex: "#AFAFAF"), "archivebox.fill")
+        }
+        return (Color(hex: "#8CB3A4"), "info.circle.fill")
+    }
+
+    // MARK: - Inline image extraction
+
+    private enum ContentSegment {
+        case text(String)
+        case imageData(Data)
+    }
+
+    private func extractInlineImages(_ text: String) -> [ContentSegment] {
+        // Match markdown images with data URIs: ![...](data:image/...;base64,...)
+        // Also match bare data URIs: data:image/...;base64,...
+        let pattern = "!\\[[^\\]]*\\]\\(data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)\\)|(?<![\\(])data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return [.text(text)]
+        }
+
+        var segments: [ContentSegment] = []
+        var lastEnd = text.startIndex
+        let nsRange = NSRange(text.startIndex..., in: text)
+
+        for match in regex.matches(in: text, range: nsRange) {
+            guard let matchRange = Range(match.range, in: text) else { continue }
+
+            // Add preceding text
+            if lastEnd < matchRange.lowerBound {
+                let preceding = String(text[lastEnd..<matchRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !preceding.isEmpty { segments.append(.text(preceding)) }
+            }
+
+            // Try capture group 1 (markdown image) then group 2 (bare data URI)
+            let base64String: String?
+            if match.range(at: 1).location != NSNotFound, let r = Range(match.range(at: 1), in: text) {
+                base64String = String(text[r])
+            } else if match.range(at: 2).location != NSNotFound, let r = Range(match.range(at: 2), in: text) {
+                base64String = String(text[r])
+            } else {
+                base64String = nil
+            }
+
+            if let b64 = base64String,
+               let data = Data(base64Encoded: b64.replacingOccurrences(of: "\\s", with: "", options: .regularExpression), options: .ignoreUnknownCharacters) {
+                segments.append(.imageData(data))
+            }
+
+            lastEnd = matchRange.upperBound
+        }
+
+        // Add remaining text
+        if lastEnd < text.endIndex {
+            let remaining = String(text[lastEnd...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !remaining.isEmpty { segments.append(.text(remaining)) }
+        }
+
+        return segments.isEmpty ? [.text(text)] : segments
+    }
+}
+
+// MARK: - Plain syntax highlighter (no highlighting, just monospace)
+
+struct PlainSyntaxHighlighter: CodeSyntaxHighlighter {
+    func highlightCode(_ code: String, language: String?) -> Text {
+        Text(code)
+    }
+}
+
+extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
+    static var plain: PlainSyntaxHighlighter { PlainSyntaxHighlighter() }
+}
+
+// MARK: - Previews
+
+#Preview("User Message") {
+    ScrollView {
+        VStack(spacing: 16) {
+            MessageBubbleView(message: ChatMessage(
+                role: .user,
+                text: "Can you help me understand how SwiftUI state management works?"
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .user,
+                text: "Here's a longer message that should wrap across multiple lines to show how the bubble handles text wrapping properly."
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+#Preview("Assistant Message") {
+    ScrollView {
+        VStack(spacing: 16) {
+            MessageBubbleView(message: ChatMessage(
+                role: .assistant,
+                text: "SwiftUI uses **property wrappers** like `@State`, `@Binding`, and `@ObservableObject` to manage state.\n\nHere's a quick example:\n\n```swift\nstruct CounterView: View {\n    @State private var count = 0\n    \n    var body: some View {\n        Button(\"Count: \\(count)\") {\n            count += 1\n        }\n    }\n}\n```\n\nThe `@State` wrapper tells SwiftUI to manage this value and re-render when it changes."
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+#Preview("Assistant Diff") {
+    ScrollView {
+        VStack(spacing: 16) {
+            MessageBubbleView(message: ChatMessage(
+                role: .assistant,
+                text: "Here's the patch:\n\n```diff\n@@ -1,4 +1,6 @@\n-struct TitleView: View {\n-    var body: some View {\n-        Text(\"Hello\")\n-    }\n-}\n+struct TitleView: View {\n+    let title: String\n+\n+    var body: some View {\n+        Text(title)\n+    }\n+}\n```"
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+#Preview("System Messages") {
+    ScrollView {
+        VStack(spacing: 16) {
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### Command\nCommand:\n```bash\nls -la\n```\nStatus: completed\nDuration: 0.1s\n\nOutput:\n```\ntotal 48\ndrwxr-xr-x  12 user  staff   384 Feb 24 10:00 .\ndrwxr-xr-x   5 user  staff   160 Feb 24 09:00 ..\n-rw-r--r--   1 user  staff  1234 Feb 24 10:00 file.swift\n```"
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### File Read\nPath: /Users/dev/project/Sources/App.swift\n\n```swift\nimport SwiftUI\n\n@main\nstruct MyApp: App {\n    var body: some Scene {\n        WindowGroup {\n            ContentView()\n        }\n    }\n}\n```"
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### MCP Tool\nTool: web_search\nStatus: completed\n\nSearched for \"SwiftUI best practices 2024\""
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### Plan\n1. Read the existing code structure\n2. Identify the components to modify\n3. Implement the changes\n4. Test and verify"
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+#Preview("Reasoning Message") {
+    ScrollView {
+        VStack(spacing: 16) {
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### Reasoning\nLet me think through this step by step. The user is asking about state management, so I should explain the different property wrappers and when to use each one. I'll start with @State for simple local state, then move to @Binding for passing state down, and finally cover @ObservableObject for more complex scenarios."
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+#Preview("Conversation") {
+    ScrollView {
+        VStack(spacing: 12) {
+            MessageBubbleView(message: ChatMessage(
+                role: .user,
+                text: "What's the difference between @State and @StateObject?"
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .system,
+                text: "### Reasoning\nThis is a common question about SwiftUI state management. I should clarify the ownership semantics and lifecycle differences."
+            ))
+            
+            MessageBubbleView(message: ChatMessage(
+                role: .assistant,
+                text: "Great question! Here's the key difference:\n\n**@State** is for simple value types owned by the view:\n```swift\n@State private var count = 0\n```\n\n**@StateObject** is for reference types (classes) that the view creates and owns:\n```swift\n@StateObject private var viewModel = MyViewModel()\n```\n\nUse `@StateObject` when you need to create an observable object and ensure it survives view re-creation."
+            ))
+        }
+        .padding()
+    }
+    .background(Color(uiColor: .systemBackground))
+}
+
+// MARK: - Mocode Markdown Theme
+
+extension MarkdownUI.Theme {
+    static func mocode(bodySize: CGFloat, codeSize: CGFloat) -> Theme {
+        Theme()
+            .text {
+                ForegroundColor(MocodeTheme.textBody)
+                FontFamily(.system(.rounded))
+                FontSize(bodySize)
+            }
+            .heading1 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.bold)
+                        FontSize(bodySize * 1.43)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 16, bottom: 8)
+            }
+            .heading2 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(bodySize * 1.21)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 12, bottom: 6)
+            }
+            .heading3 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(bodySize * 1.07)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 10, bottom: 4)
+            }
+            .strong {
+                FontWeight(.semibold)
+                ForegroundColor(MocodeTheme.textPrimary)
+            }
+            .emphasis {
+                FontStyle(.italic)
+            }
+            .link {
+                ForegroundColor(MocodeTheme.accent)
+            }
+            .code {
+                FontFamily(.system(.monospaced))
+                FontSize(codeSize)
+                ForegroundColor(MocodeTheme.accent)
+            }
+            .codeBlock { configuration in
+                CodeBlockView(
+                    language: configuration.language ?? "",
+                    code: configuration.content
+                )
+                .markdownMargin(top: 8, bottom: 8)
+            }
+            .listItem { configuration in
+                configuration.label
+                    .markdownMargin(top: 4, bottom: 4)
+            }
+            .blockquote { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        ForegroundColor(MocodeTheme.textSecondary)
+                        FontStyle(.italic)
+                    }
+                    .padding(.leading, 12)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(MocodeTheme.border)
+                            .frame(width: 3)
+                    }
+                    .markdownMargin(top: 8, bottom: 8)
+            }
+            .thematicBreak {
+                Divider()
+                    .overlay(MocodeTheme.border)
+                    .markdownMargin(top: 12, bottom: 12)
+            }
+    }
+
+    static func mocodeSystem(bodySize: CGFloat, codeSize: CGFloat) -> Theme {
+        Theme()
+            .text {
+                ForegroundColor(MocodeTheme.textSystem)
+                FontFamily(.system(.rounded))
+                FontSize(bodySize)
+            }
+            .heading1 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.bold)
+                        FontSize(bodySize * 1.31)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 12, bottom: 6)
+            }
+            .heading2 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(bodySize * 1.15)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 10, bottom: 4)
+            }
+            .heading3 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(bodySize * 1.08)
+                        ForegroundColor(MocodeTheme.textPrimary)
+                    }
+                    .markdownMargin(top: 8, bottom: 4)
+            }
+            .strong {
+                FontWeight(.semibold)
+                ForegroundColor(MocodeTheme.textPrimary)
+            }
+            .emphasis {
+                FontStyle(.italic)
+            }
+            .link {
+                ForegroundColor(MocodeTheme.accent)
+            }
+            .code {
+                FontFamily(.system(.monospaced))
+                FontSize(codeSize)
+                ForegroundColor(MocodeTheme.accent)
+            }
+            .codeBlock { configuration in
+                CodeBlockView(
+                    language: configuration.language ?? "",
+                    code: configuration.content
+                )
+                .markdownMargin(top: 6, bottom: 6)
+            }
+            .listItem { configuration in
+                configuration.label
+                    .markdownMargin(top: 3, bottom: 3)
+            }
+            .blockquote { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        ForegroundColor(MocodeTheme.textSecondary)
+                        FontStyle(.italic)
+                    }
+                    .padding(.leading, 12)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(MocodeTheme.border)
+                            .frame(width: 3)
+                    }
+                    .markdownMargin(top: 6, bottom: 6)
+            }
+            .thematicBreak {
+                Divider()
+                    .overlay(MocodeTheme.border)
+                    .markdownMargin(top: 8, bottom: 8)
+            }
+    }
+}
