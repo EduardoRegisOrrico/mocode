@@ -4,18 +4,11 @@
   <img src="Sources/Mocode/Resources/brand_logo.png" alt="mocode logo" width="180" />
 </p>
 
-`mocode` is an iOS client for Codex. It supports:
-
-- `MocodeRemote`: remote-only mode (default scheme; no bundled on-device Rust server)
-- `Mocode`: includes the on-device Rust bridge (`codex_bridge.xcframework`)
+`mocode` is an iOS client for Codex in remote mode.
 
 ## Prerequisites
 
 - Xcode.app (full install, not only CLT)
-- Rust + iOS targets:
-  ```bash
-  rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-  ```
 - `xcodegen` (for regenerating `Mocode.xcodeproj`):
   ```bash
   brew install xcodegen
@@ -37,13 +30,13 @@ Sync/apply patch (idempotent):
 ./scripts/sync-codex.sh
 ```
 
-## Build the Rust bridge
+## Optional: Build the Rust bridge
 
 ```bash
 ./scripts/build-rust.sh
 ```
 
-This script:
+This is optional and not required for the default app target. The script:
 
 1. Syncs `third_party/codex` and applies the iOS hook patch
 2. Builds `codex-bridge` for device + simulator targets
@@ -65,13 +58,12 @@ open Mocode.xcodeproj
 
 Schemes:
 
-- `MocodeRemote` (default): no on-device Rust bridge
-- `Mocode`: uses bundled `codex_bridge.xcframework`
+- `Mocode`
 
 CLI build example:
 
 ```bash
-xcodebuild -project Mocode.xcodeproj -scheme MocodeRemote -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+xcodebuild -project Mocode.xcodeproj -scheme Mocode -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
 ## Important paths

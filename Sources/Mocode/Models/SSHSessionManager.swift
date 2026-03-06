@@ -7,6 +7,15 @@ actor SSHSessionManager {
     private var client: SSHClient?
     private var connectedHost: String?
     private let defaultRemotePort: UInt16 = 8390
+    private var shellBootstrapScript: String {
+        """
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.volta/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+        for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
+          [ -f "$f" ] && . "$f" 2>/dev/null
+        done
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.volta/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+        """
+    }
 
     enum AvailableBackend: String, Identifiable, CaseIterable {
         case codex
@@ -154,14 +163,16 @@ actor SSHSessionManager {
     func resolveAvailableBackends() async throws -> [AvailableBackend] {
         guard let client else { throw SSHError.notConnected }
         let script = """
-        for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
-          [ -f "$f" ] && . "$f" 2>/dev/null
-        done
+        \(shellBootstrapScript)
         found=""
-        if command -v codex >/dev/null 2>&1 || [ -x "$HOME/.volta/bin/codex" ] || [ -x "$HOME/.cargo/bin/codex" ] || command -v codex-app-server >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
+        codex_path="$(command -v codex 2>/dev/null || true)"
+        codex_app_path="$(command -v codex-app-server 2>/dev/null || true)"
+        if ([ -n "$codex_path" ] && [ -f "$codex_path" ] && [ -x "$codex_path" ]) || [ -x "$HOME/.local/bin/codex" ] || [ -x "$HOME/.volta/bin/codex" ] || [ -x "$HOME/.cargo/bin/codex" ] || [ -x "$HOME/.npm-global/bin/codex" ] || [ -x "$HOME/.bun/bin/codex" ] || [ -x "$HOME/bin/codex" ] || [ -x "/opt/homebrew/bin/codex" ] || [ -x "/usr/local/bin/codex" ] || ([ -n "$codex_app_path" ] && [ -f "$codex_app_path" ] && [ -x "$codex_app_path" ]) || [ -x "$HOME/.local/bin/codex-app-server" ] || [ -x "$HOME/.cargo/bin/codex-app-server" ] || [ -x "$HOME/bin/codex-app-server" ] || [ -x "/opt/homebrew/bin/codex-app-server" ] || [ -x "/usr/local/bin/codex-app-server" ]; then
           found="${found}codex\\n"
         fi
-        if command -v claude-app-server >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/claude-app-server" ] || command -v claude >/dev/null 2>&1 || [ -x "$HOME/.local/bin/claude" ]; then
+        claude_bridge_path="$(command -v claude-app-server 2>/dev/null || true)"
+        claude_path="$(command -v claude 2>/dev/null || true)"
+        if ([ -n "$claude_bridge_path" ] && [ -f "$claude_bridge_path" ] && [ -x "$claude_bridge_path" ]) || [ -x "$HOME/.local/bin/claude-app-server" ] || [ -x "$HOME/.cargo/bin/claude-app-server" ] || [ -x "$HOME/bin/claude-app-server" ] || [ -x "/opt/homebrew/bin/claude-app-server" ] || [ -x "/usr/local/bin/claude-app-server" ] || ([ -n "$claude_path" ] && [ -f "$claude_path" ] && [ -x "$claude_path" ]) || [ -x "$HOME/.local/bin/claude" ] || [ -x "$HOME/bin/claude" ] || [ -x "/opt/homebrew/bin/claude" ] || [ -x "/usr/local/bin/claude" ]; then
           found="${found}claude\\n"
         fi
         printf '%b' "$found"
@@ -279,34 +290,72 @@ actor SSHSessionManager {
         switch backend {
         case .codex:
             script = """
-            for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
-              [ -f "$f" ] && . "$f" 2>/dev/null
-            done
-            if command -v codex >/dev/null 2>&1; then
-              printf 'codex:%s' "$(command -v codex)"
+            \(shellBootstrapScript)
+            codex_path="$(command -v codex 2>/dev/null || true)"
+            if [ -n "$codex_path" ] && [ -f "$codex_path" ] && [ -x "$codex_path" ]; then
+              printf 'codex:%s' "$codex_path"
+            elif [ -x "$HOME/.local/bin/codex" ]; then
+              printf 'codex:%s' "$HOME/.local/bin/codex"
             elif [ -x "$HOME/.volta/bin/codex" ]; then
               printf 'codex:%s' "$HOME/.volta/bin/codex"
             elif [ -x "$HOME/.cargo/bin/codex" ]; then
               printf 'codex:%s' "$HOME/.cargo/bin/codex"
-            elif command -v codex-app-server >/dev/null 2>&1; then
-              printf 'codex-app-server:%s' "$(command -v codex-app-server)"
-            elif [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
-              printf 'codex-app-server:%s' "$HOME/.cargo/bin/codex-app-server"
+            elif [ -x "$HOME/.npm-global/bin/codex" ]; then
+              printf 'codex:%s' "$HOME/.npm-global/bin/codex"
+            elif [ -x "$HOME/.bun/bin/codex" ]; then
+              printf 'codex:%s' "$HOME/.bun/bin/codex"
+            elif [ -x "$HOME/bin/codex" ]; then
+              printf 'codex:%s' "$HOME/bin/codex"
+            elif [ -x "/opt/homebrew/bin/codex" ]; then
+              printf 'codex:%s' "/opt/homebrew/bin/codex"
+            elif [ -x "/usr/local/bin/codex" ]; then
+              printf 'codex:%s' "/usr/local/bin/codex"
+            else
+              app_server_path="$(command -v codex-app-server 2>/dev/null || true)"
+              if [ -n "$app_server_path" ] && [ -f "$app_server_path" ] && [ -x "$app_server_path" ]; then
+                printf 'codex-app-server:%s' "$app_server_path"
+              elif [ -x "$HOME/.local/bin/codex-app-server" ]; then
+                printf 'codex-app-server:%s' "$HOME/.local/bin/codex-app-server"
+              elif [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
+                printf 'codex-app-server:%s' "$HOME/.cargo/bin/codex-app-server"
+              elif [ -x "$HOME/bin/codex-app-server" ]; then
+                printf 'codex-app-server:%s' "$HOME/bin/codex-app-server"
+              elif [ -x "/opt/homebrew/bin/codex-app-server" ]; then
+                printf 'codex-app-server:%s' "/opt/homebrew/bin/codex-app-server"
+              elif [ -x "/usr/local/bin/codex-app-server" ]; then
+                printf 'codex-app-server:%s' "/usr/local/bin/codex-app-server"
+              fi
             fi
             """
         case .claude:
             script = """
-            for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
-              [ -f "$f" ] && . "$f" 2>/dev/null
-            done
-            if command -v claude-app-server >/dev/null 2>&1; then
-              printf 'claude-app-server:%s' "$(command -v claude-app-server)"
+            \(shellBootstrapScript)
+            claude_bridge_path="$(command -v claude-app-server 2>/dev/null || true)"
+            if [ -n "$claude_bridge_path" ] && [ -f "$claude_bridge_path" ] && [ -x "$claude_bridge_path" ]; then
+              printf 'claude-app-server:%s' "$claude_bridge_path"
+            elif [ -x "$HOME/.local/bin/claude-app-server" ]; then
+              printf 'claude-app-server:%s' "$HOME/.local/bin/claude-app-server"
             elif [ -x "$HOME/.cargo/bin/claude-app-server" ]; then
               printf 'claude-app-server:%s' "$HOME/.cargo/bin/claude-app-server"
-            elif command -v claude >/dev/null 2>&1; then
-              printf 'claude:%s' "$(command -v claude)"
-            elif [ -x "$HOME/.local/bin/claude" ]; then
-              printf 'claude:%s' "$HOME/.local/bin/claude"
+            elif [ -x "$HOME/bin/claude-app-server" ]; then
+              printf 'claude-app-server:%s' "$HOME/bin/claude-app-server"
+            elif [ -x "/opt/homebrew/bin/claude-app-server" ]; then
+              printf 'claude-app-server:%s' "/opt/homebrew/bin/claude-app-server"
+            elif [ -x "/usr/local/bin/claude-app-server" ]; then
+              printf 'claude-app-server:%s' "/usr/local/bin/claude-app-server"
+            else
+              claude_path="$(command -v claude 2>/dev/null || true)"
+              if [ -n "$claude_path" ] && [ -f "$claude_path" ] && [ -x "$claude_path" ]; then
+                printf 'claude:%s' "$claude_path"
+              elif [ -x "$HOME/.local/bin/claude" ]; then
+                printf 'claude:%s' "$HOME/.local/bin/claude"
+              elif [ -x "$HOME/bin/claude" ]; then
+                printf 'claude:%s' "$HOME/bin/claude"
+              elif [ -x "/opt/homebrew/bin/claude" ]; then
+                printf 'claude:%s' "/opt/homebrew/bin/claude"
+              elif [ -x "/usr/local/bin/claude" ]; then
+                printf 'claude:%s' "/usr/local/bin/claude"
+              fi
             fi
             """
         }
@@ -332,27 +381,63 @@ actor SSHSessionManager {
 
     private func resolveServerLaunchCommand(client: SSHClient) async throws -> ServerLaunchCommand? {
         let script = """
-        for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
-          [ -f "$f" ] && . "$f" 2>/dev/null
-        done
-        if command -v codex >/dev/null 2>&1; then
-          printf 'codex:%s' "$(command -v codex)"
+        \(shellBootstrapScript)
+        codex_path="$(command -v codex 2>/dev/null || true)"
+        codex_app_path="$(command -v codex-app-server 2>/dev/null || true)"
+        claude_bridge_path="$(command -v claude-app-server 2>/dev/null || true)"
+        claude_path="$(command -v claude 2>/dev/null || true)"
+        if [ -n "$codex_path" ] && [ -f "$codex_path" ] && [ -x "$codex_path" ]; then
+          printf 'codex:%s' "$codex_path"
+        elif [ -x "$HOME/.local/bin/codex" ]; then
+          printf 'codex:%s' "$HOME/.local/bin/codex"
         elif [ -x "$HOME/.volta/bin/codex" ]; then
           printf 'codex:%s' "$HOME/.volta/bin/codex"
         elif [ -x "$HOME/.cargo/bin/codex" ]; then
           printf 'codex:%s' "$HOME/.cargo/bin/codex"
-        elif command -v codex-app-server >/dev/null 2>&1; then
-          printf 'codex-app-server:%s' "$(command -v codex-app-server)"
+        elif [ -x "$HOME/.npm-global/bin/codex" ]; then
+          printf 'codex:%s' "$HOME/.npm-global/bin/codex"
+        elif [ -x "$HOME/.bun/bin/codex" ]; then
+          printf 'codex:%s' "$HOME/.bun/bin/codex"
+        elif [ -x "$HOME/bin/codex" ]; then
+          printf 'codex:%s' "$HOME/bin/codex"
+        elif [ -x "/opt/homebrew/bin/codex" ]; then
+          printf 'codex:%s' "/opt/homebrew/bin/codex"
+        elif [ -x "/usr/local/bin/codex" ]; then
+          printf 'codex:%s' "/usr/local/bin/codex"
+        elif [ -n "$codex_app_path" ] && [ -f "$codex_app_path" ] && [ -x "$codex_app_path" ]; then
+          printf 'codex-app-server:%s' "$codex_app_path"
+        elif [ -x "$HOME/.local/bin/codex-app-server" ]; then
+          printf 'codex-app-server:%s' "$HOME/.local/bin/codex-app-server"
         elif [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
           printf 'codex-app-server:%s' "$HOME/.cargo/bin/codex-app-server"
-        elif command -v claude-app-server >/dev/null 2>&1; then
-          printf 'claude-app-server:%s' "$(command -v claude-app-server)"
+        elif [ -x "$HOME/bin/codex-app-server" ]; then
+          printf 'codex-app-server:%s' "$HOME/bin/codex-app-server"
+        elif [ -x "/opt/homebrew/bin/codex-app-server" ]; then
+          printf 'codex-app-server:%s' "/opt/homebrew/bin/codex-app-server"
+        elif [ -x "/usr/local/bin/codex-app-server" ]; then
+          printf 'codex-app-server:%s' "/usr/local/bin/codex-app-server"
+        elif [ -n "$claude_bridge_path" ] && [ -f "$claude_bridge_path" ] && [ -x "$claude_bridge_path" ]; then
+          printf 'claude-app-server:%s' "$claude_bridge_path"
+        elif [ -x "$HOME/.local/bin/claude-app-server" ]; then
+          printf 'claude-app-server:%s' "$HOME/.local/bin/claude-app-server"
         elif [ -x "$HOME/.cargo/bin/claude-app-server" ]; then
           printf 'claude-app-server:%s' "$HOME/.cargo/bin/claude-app-server"
-        elif command -v claude >/dev/null 2>&1; then
-          printf 'claude:%s' "$(command -v claude)"
+        elif [ -x "$HOME/bin/claude-app-server" ]; then
+          printf 'claude-app-server:%s' "$HOME/bin/claude-app-server"
+        elif [ -x "/opt/homebrew/bin/claude-app-server" ]; then
+          printf 'claude-app-server:%s' "/opt/homebrew/bin/claude-app-server"
+        elif [ -x "/usr/local/bin/claude-app-server" ]; then
+          printf 'claude-app-server:%s' "/usr/local/bin/claude-app-server"
+        elif [ -n "$claude_path" ] && [ -f "$claude_path" ] && [ -x "$claude_path" ]; then
+          printf 'claude:%s' "$claude_path"
         elif [ -x "$HOME/.local/bin/claude" ]; then
           printf 'claude:%s' "$HOME/.local/bin/claude"
+        elif [ -x "$HOME/bin/claude" ]; then
+          printf 'claude:%s' "$HOME/bin/claude"
+        elif [ -x "/opt/homebrew/bin/claude" ]; then
+          printf 'claude:%s' "/opt/homebrew/bin/claude"
+        elif [ -x "/usr/local/bin/claude" ]; then
+          printf 'claude:%s' "/usr/local/bin/claude"
         fi
         """
         let output = String(buffer: try await client.executeCommand(script))
@@ -382,8 +467,7 @@ actor SSHSessionManager {
         case .claude:
             throw SSHError.claudeBridgeMissing
         }
-        let profileInit = "for f in \"$HOME/.profile\" \"$HOME/.bash_profile\" \"$HOME/.bashrc\" \"$HOME/.zprofile\" \"$HOME/.zshrc\"; do [ -f \"$f\" ] && . \"$f\" 2>/dev/null; done;"
-        return "\(profileInit) nohup \(launch) </dev/null >\(shellQuote(logPath)) 2>&1 & echo $!"
+        return "\(shellBootstrapScript)\nnohup \(launch) </dev/null >\(shellQuote(logPath)) 2>&1 & echo $!"
     }
 
     private func isPortListening(client: SSHClient, port: UInt16) async throws -> Bool {

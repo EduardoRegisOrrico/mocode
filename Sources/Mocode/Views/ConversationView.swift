@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 import Inject
 
 struct ConversationView: View {
@@ -12,9 +13,25 @@ struct ConversationView: View {
     @State private var showAttachMenu = false
     @State private var showPhotoPicker = false
     @State private var showCamera = false
+    @State private var showFileImporter = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var attachedImage: UIImage?
+    @State private var attachedFiles: [ComposerAttachedFile] = []
     @State private var showModelSelector = false
+    @State private var isNearBottom = true
+    @State private var unreadSinceAway = 0
+    @State private var didInitialScroll = false
+    @State private var pinchStartScale: CGFloat?
+    @State private var showZoomHUD = false
+    @State private var zoomHUDTask: Task<Void, Never>?
+    @State private var composerAttachmentError: String?
+
+    private struct ComposerAttachedFile: Identifiable, Equatable {
+        let id = UUID()
+        let name: String
+        let path: String
+        let size: Int64
+    }
 
     private var messages: [ChatMessage] {
         serverManager.activeThread?.messages ?? []
@@ -26,6 +43,16 @@ struct ConversationView: View {
 
     private var activeConn: ServerConnection? {
         serverManager.activeConnection
+    }
+
+    private var effectiveCwd: String {
+        if let cwd = serverManager.activeThread?.cwd, !cwd.isEmpty {
+            return cwd
+        }
+        if !appState.currentCwd.isEmpty {
+            return appState.currentCwd
+        }
+        return workDir
     }
 
     private var shortModelName: String {
@@ -83,9 +110,14 @@ struct ConversationView: View {
             }
         }
         .onChange(of: serverManager.activeThreadKey) { _, _ in
+            syncWorkDirFromActiveThread()
+            didInitialScroll = false
+            unreadSinceAway = 0
+            isNearBottom = true
             Task { await loadModelsIfNeeded() }
         }
         .task {
+            syncWorkDirFromActiveThread()
             await loadModelsIfNeeded()
         }
         .sheet(isPresented: $showModelSelector) {
@@ -110,6 +142,11 @@ struct ConversationView: View {
                     serverManager.skillsLoaded = false
                     serverManager.skills = []
                 }
+        }
+        .sheet(isPresented: $appState.showSettings) {
+            SettingsView()
+                .environmentObject(serverManager)
+                .environmentObject(appState)
         }
         .enableInjection()
     }
@@ -159,9 +196,16 @@ struct ConversationView: View {
     }
 
     private func handleSlashCommand(_ text: String) {
-        let command = text.dropFirst()
+        let remainder = text.dropFirst()
+        let command = remainder
             .split(separator: " ", maxSplits: 1).first
             .map { String($0).lowercased() } ?? ""
+        let query = remainder
+            .split(separator: " ", maxSplits: 1)
+            .dropFirst()
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         switch command {
         case "mcp", "plugin", "plugins":
@@ -170,41 +214,178 @@ struct ConversationView: View {
             appState.showSkills = true
         case "settings":
             appState.showSettings = true
+        case "files", "file", "search":
+            guard !query.isEmpty else {
+                let msg = ChatMessage(
+                    role: .system,
+                    text: "### File Search\nUsage: /files <query>"
+                )
+                serverManager.activeThread?.messages.append(msg)
+                return
+            }
+            Task { await performFileSearch(query) }
         default:
             let msg = ChatMessage(
                 role: .system,
-                text: "Unknown command: /\(command). Available commands: /plugins, /skills, /mcp, /settings"
+                text: "Unknown command: /\(command). Available commands: /plugins, /skills, /mcp, /settings, /files"
             )
             serverManager.activeThread?.messages.append(msg)
         }
     }
 
+    private func performFileSearch(_ query: String) async {
+        guard let conn = activeConn, conn.isConnected else {
+            serverManager.activeThread?.messages.append(
+                ChatMessage(role: .system, text: "### File Search\nNot connected to a server.")
+            )
+            return
+        }
+        do {
+            let root = effectiveCwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "/" : effectiveCwd
+            let response = try await conn.fuzzyFileSearch(
+                query: query,
+                roots: [root],
+                cancellationToken: "ios-composer-file-search"
+            )
+            let files = response.files.prefix(20).map { "- \($0.path)" }
+            let body: String
+            if files.isEmpty {
+                body = "Query: \(query)\n\nNo files found."
+            } else {
+                body = "Query: \(query)\n\n\(files.joined(separator: "\n"))"
+            }
+            serverManager.activeThread?.messages.append(
+                ChatMessage(role: .system, text: "### File Search\n\(body)")
+            )
+        } catch {
+            serverManager.activeThread?.messages.append(
+                ChatMessage(role: .system, text: "### File Search\nQuery: \(query)\n\nError: \(error.localizedDescription)")
+            )
+        }
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(messages) { message in
-                        MessageBubbleView(message: message)
-                            .id(message.id)
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(messages) { message in
+                            MessageBubbleView(message: message)
+                                .id(message.id)
+                        }
+                        if case .thinking = threadStatus {
+                            TypingIndicator()
+                        }
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottom")
+                            .onAppear { isNearBottom = true }
+                            .onDisappear { isNearBottom = false }
                     }
-                    if case .thinking = threadStatus {
-                        TypingIndicator()
-                    }
-                    Color.clear.frame(height: 1).id("bottom")
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-                .padding(.bottom, 8)
-            }
-            .onTapGesture { inputFocused = false }
-            .onChange(of: messages.count) {
-                withAnimation { proxy.scrollTo("bottom") }
+                .onTapGesture { inputFocused = false }
+                .gesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            if pinchStartScale == nil {
+                                pinchStartScale = appState.chatTextScale
+                            }
+                            let base = pinchStartScale ?? appState.chatTextScale
+                            appState.chatTextScale = min(max(base * value, 0.8), 1.8)
+                            showZoomHUD = true
+                            zoomHUDTask?.cancel()
+                        }
+                        .onEnded { _ in
+                            pinchStartScale = nil
+                            zoomHUDTask?.cancel()
+                            zoomHUDTask = Task {
+                                try? await Task.sleep(for: .milliseconds(700))
+                                await MainActor.run {
+                                    withAnimation(.easeOut(duration: 0.18)) {
+                                        showZoomHUD = false
+                                    }
+                                }
+                            }
+                        }
+                )
+                .task(id: serverManager.activeThreadKey) {
+                    // Ensure the first render of a loaded thread lands on latest.
+                    guard !didInitialScroll else { return }
+                    try? await Task.sleep(for: .milliseconds(80))
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                    didInitialScroll = true
+                }
+                .onChange(of: messages.count) {
+                    if isNearBottom {
+                        unreadSinceAway = 0
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    } else {
+                        unreadSinceAway += 1
+                    }
+                }
+
+                if !isNearBottom && !messages.isEmpty {
+                    Button {
+                        unreadSinceAway = 0
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(unreadSinceAway > 0 ? "Latest (\(unreadSinceAway))" : "Latest")
+                                .font(.system(.caption, weight: .semibold))
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        .foregroundColor(MocodeTheme.accentForeground)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(MocodeTheme.accent, in: Capsule())
+                    }
+                    .padding(.trailing, 18)
+                    .padding(.bottom, 14)
+                }
+                
+                if showZoomHUD {
+                    Text("\(Int((appState.chatTextScale * 100).rounded()))%")
+                        .font(.system(.caption, weight: .semibold))
+                        .foregroundColor(MocodeTheme.accentForeground)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(MocodeTheme.accent.opacity(0.95), in: Capsule())
+                        .padding(.trailing, 18)
+                        .padding(.bottom, isNearBottom ? 14 : 54)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
             }
         }
     }
 
     private var hasText: Bool {
-        !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var hasAttachment: Bool {
+        attachedImage != nil || !attachedFiles.isEmpty
+    }
+
+    private var canSend: Bool {
+        hasText || hasAttachment
+    }
+
+    private var usesExpandedInputShape: Bool {
+        inputText.contains("\n") || inputText.count > 42
+    }
+
+    private var inputBubbleCornerRadius: CGFloat {
+        usesExpandedInputShape ? 18 : 24
     }
 
     private var inputBar: some View {
@@ -231,6 +412,38 @@ struct ConversationView: View {
                 }
             }
 
+            if !attachedFiles.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(attachedFiles) { file in
+                            HStack(spacing: 6) {
+                                Image(systemName: "doc")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(MocodeTheme.textSecondary)
+                                Text(file.name)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(MocodeTheme.textPrimary)
+                                    .lineLimit(1)
+                                Text(fileSizeLabel(file.size))
+                                    .font(.system(size: 11, design: .rounded))
+                                    .foregroundColor(MocodeTheme.textMuted)
+                                Button {
+                                    removeAttachedFile(file)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(MocodeTheme.textMuted)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(MocodeTheme.surface.opacity(0.9), in: Capsule())
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+            }
+
             HStack(alignment: .bottom, spacing: 8) {
                 Button { showAttachMenu = true } label: {
                     Image(systemName: "paperclip")
@@ -240,41 +453,57 @@ struct ConversationView: View {
                 }
                 .glassEffect(.regular.interactive(), in: .circle)
 
-                HStack(alignment: .bottom, spacing: 0) {
+                HStack(alignment: .bottom, spacing: 8) {
                     TextField("Message mocode...", text: $inputText, axis: .vertical)
                         .font(.system(size: 16))
                         .foregroundColor(MocodeTheme.textPrimary)
                         .lineLimit(1...5)
                         .focused($inputFocused)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.leading, 14)
                         .padding(.vertical, 12)
+                        .padding(.trailing, 2)
 
-                    if hasText {
-                        Button {
-                            let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !text.isEmpty else { return }
+                    Button {
+                        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard canSend else { return }
+
+                        if text.hasPrefix("/") && !hasAttachment {
+                            inputText = ""
+                            handleSlashCommand(text)
+                        } else {
+                            let additionalInput = buildAdditionalInputs()
+                            let effectiveText = text.isEmpty ? "Attached files" : text
                             inputText = ""
                             attachedImage = nil
-
-                            if text.hasPrefix("/") {
-                                handleSlashCommand(text)
-                            } else {
-                                let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
-                                let effort = appState.reasoningEffort
-                                Task { await serverManager.send(text, cwd: workDir, model: model, effort: effort) }
+                            attachedFiles.removeAll()
+                            let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
+                            let effort = appState.reasoningEffort
+                            Task {
+                                await serverManager.send(
+                                    effectiveText,
+                                    additionalInput: additionalInput,
+                                    cwd: effectiveCwd,
+                                    model: model,
+                                    effort: effort,
+                                    approvalPolicy: appState.resolvedApprovalPolicy,
+                                    sandboxMode: appState.resolvedSandboxMode
+                                )
                             }
-                        } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundColor(MocodeTheme.accentForeground)
-                                .frame(width: 32, height: 32)
-                                .background(MocodeTheme.accent, in: Circle())
                         }
-                        .padding(.trailing, 5)
-                        .padding(.bottom, 5)
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(MocodeTheme.accentForeground)
+                            .frame(width: 32, height: 32)
+                            .background(MocodeTheme.accent, in: Circle())
                     }
+                    .opacity(canSend ? 1 : 0.45)
+                    .disabled(!canSend)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
                 }
-                .glassEffect(.regular, in: .capsule)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: inputBubbleCornerRadius, style: .continuous))
             }
         }
         .padding(.horizontal, 16)
@@ -285,8 +514,16 @@ struct ConversationView: View {
         .confirmationDialog("Attach", isPresented: $showAttachMenu) {
             Button("Photo Library") { showPhotoPicker = true }
             Button("Take Photo") { showCamera = true }
+            Button("File") { showFileImporter = true }
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhoto, matching: .images)
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            importFiles(result: result)
+        }
         .onChange(of: selectedPhoto) { _, item in
             guard let item else { return }
             Task {
@@ -296,9 +533,118 @@ struct ConversationView: View {
                 }
             }
         }
+        .alert("Attachment Error", isPresented: Binding(
+            get: { composerAttachmentError != nil },
+            set: { if !$0 { composerAttachmentError = nil } }
+        )) {
+            Button("OK", role: .cancel) { composerAttachmentError = nil }
+        } message: {
+            Text(composerAttachmentError ?? "Unknown attachment error")
+        }
         .fullScreenCover(isPresented: $showCamera) {
             CameraView(image: $attachedImage)
                 .ignoresSafeArea()
+        }
+    }
+
+    private func fileSizeLabel(_ size: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+    }
+
+    private func removeAttachedFile(_ file: ComposerAttachedFile) {
+        attachedFiles.removeAll { $0.id == file.id }
+        try? FileManager.default.removeItem(atPath: file.path)
+    }
+
+    private func buildAdditionalInputs() -> [UserInput] {
+        var inputs: [UserInput] = []
+
+        if let image = attachedImage, let localImageInput = persistImageAttachment(image) {
+            inputs.append(localImageInput)
+        }
+
+        for file in attachedFiles {
+            inputs.append(UserInput(type: "mention", path: file.path, name: file.name))
+        }
+
+        return inputs
+    }
+
+    private func persistImageAttachment(_ image: UIImage) -> UserInput? {
+        guard let directory = ensureComposerAttachmentDirectory() else { return nil }
+        let imageData = image.jpegData(compressionQuality: 0.9) ?? image.pngData()
+        guard let imageData else { return nil }
+        let filename = "image-\(UUID().uuidString.prefix(8)).jpg"
+        let destination = directory.appendingPathComponent(filename)
+        do {
+            try imageData.write(to: destination, options: [.atomic])
+            return UserInput(type: "localImage", path: destination.path, name: filename)
+        } catch {
+            composerAttachmentError = "Failed to prepare image attachment."
+            return nil
+        }
+    }
+
+    private func importFiles(result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            for url in urls {
+                if let copied = copyFileToComposerAttachments(url) {
+                    attachedFiles.append(copied)
+                }
+            }
+        case .failure(let error):
+            composerAttachmentError = error.localizedDescription
+        }
+    }
+
+    private func copyFileToComposerAttachments(_ sourceURL: URL) -> ComposerAttachedFile? {
+        let accessGranted = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if accessGranted {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        guard let directory = ensureComposerAttachmentDirectory() else {
+            composerAttachmentError = "Failed to access attachment storage."
+            return nil
+        }
+
+        let fileName = sourceURL.lastPathComponent.isEmpty ? "file" : sourceURL.lastPathComponent
+        let destination = directory.appendingPathComponent("\(UUID().uuidString)-\(fileName)")
+
+        do {
+            try FileManager.default.copyItem(at: sourceURL, to: destination)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+            let fileSize = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+            return ComposerAttachedFile(name: fileName, path: destination.path, size: fileSize)
+        } catch {
+            composerAttachmentError = "Failed to import \(fileName)."
+            return nil
+        }
+    }
+
+    private func ensureComposerAttachmentDirectory() -> URL? {
+        guard let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = cache.appendingPathComponent("MocodeComposerAttachments", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        } catch {
+            return nil
+        }
+    }
+
+    private func syncWorkDirFromActiveThread() {
+        guard let cwd = serverManager.activeThread?.cwd, !cwd.isEmpty else { return }
+        if appState.currentCwd != cwd {
+            appState.currentCwd = cwd
+        }
+        if workDir != cwd {
+            workDir = cwd
         }
     }
 }
@@ -332,7 +678,15 @@ struct ChatInputBar: View {
     var onAttach: () -> Void = {}
     
     private var hasText: Bool {
-        !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var usesExpandedInputShape: Bool {
+        inputText.contains("\n") || inputText.count > 42
+    }
+
+    private var inputBubbleCornerRadius: CGFloat {
+        usesExpandedInputShape ? 18 : 24
     }
     
     var body: some View {
@@ -368,33 +722,35 @@ struct ChatInputBar: View {
                 }
                 .glassEffect(.regular.interactive(), in: .circle)
 
-                HStack(alignment: .bottom, spacing: 0) {
+                HStack(alignment: .bottom, spacing: 8) {
                     TextField("Message mocode...", text: $inputText, axis: .vertical)
                         .font(.system(size: 16))
                         .foregroundColor(MocodeTheme.textPrimary)
                         .lineLimit(1...5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.leading, 14)
                         .padding(.vertical, 12)
+                        .padding(.trailing, 2)
 
-                    if hasText {
-                        Button {
-                            let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !text.isEmpty else { return }
-                            onSend(text)
-                            inputText = ""
-                            attachedImage = nil
-                        } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundColor(MocodeTheme.accentForeground)
-                                .frame(width: 32, height: 32)
-                                .background(MocodeTheme.accent, in: Circle())
-                        }
-                        .padding(.trailing, 5)
-                        .padding(.bottom, 5)
+                    Button {
+                        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else { return }
+                        onSend(text)
+                        inputText = ""
+                        attachedImage = nil
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(MocodeTheme.accentForeground)
+                            .frame(width: 32, height: 32)
+                            .background(MocodeTheme.accent, in: Circle())
                     }
+                    .opacity(hasText ? 1 : 0.45)
+                    .disabled(!hasText)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
                 }
-                .glassEffect(.regular, in: .capsule)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: inputBubbleCornerRadius, style: .continuous))
             }
         }
         .padding(.horizontal, 8)

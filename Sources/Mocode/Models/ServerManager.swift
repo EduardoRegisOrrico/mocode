@@ -12,6 +12,32 @@ struct BackendFetchResult: Identifiable {
     var skillsError: String?
 }
 
+private struct AgentDirectoryEntry {
+    let serverId: String
+    let threadId: String?
+    let agentId: String?
+    let nickname: String?
+    let role: String?
+}
+
+private enum AgentLabelFormatter {
+    static func sanitized(_ value: String?) -> String? {
+        guard let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines), !cleaned.isEmpty else {
+            return nil
+        }
+        return cleaned
+    }
+
+    static func looksLikeDisplayLabel(_ value: String) -> Bool {
+        guard value.hasSuffix("]"), let openBracket = value.lastIndex(of: "[") else { return false }
+        let nickname = value[..<openBracket].trimmingCharacters(in: .whitespacesAndNewlines)
+        let roleStart = value.index(after: openBracket)
+        let roleEnd = value.index(before: value.endIndex)
+        let role = value[roleStart..<roleEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+        return !nickname.isEmpty && !role.isEmpty
+    }
+}
+
 @MainActor
 final class ServerManager: ObservableObject {
     @Published var connections: [String: ServerConnection] = [:]
@@ -22,9 +48,14 @@ final class ServerManager: ObservableObject {
     @Published var skills: [SkillMetadata] = []
     @Published var skillsLoaded = false
     @Published var backendResults: [BackendFetchResult] = []
+    @Published private(set) var agentDirectoryVersion: Int = 0
 
     private let savedServersKey = "codex_saved_servers"
     private var threadSubscriptions: [ThreadKey: AnyCancellable] = [:]
+    private var agentDirectoryByThread: [String: AgentDirectoryEntry] = [:]
+    private var agentDirectoryByAgent: [String: AgentDirectoryEntry] = [:]
+    private var liveSyncInProgress = false
+    private var scheduledSessionRefreshes: Set<String> = []
 
     /// Call after inserting a new ThreadState into `threads` to forward its changes.
     private func observeThread(_ thread: ThreadState) {
@@ -52,9 +83,11 @@ final class ServerManager: ObservableObject {
     // MARK: - Server Lifecycle
 
     func addServer(_ server: DiscoveredServer, target: ConnectionTarget) async {
+        await DebugLog.shared.log("addServer serverId=\(server.id) name=\(server.name) host=\(server.hostname) target=\(String(describing: target)) hint=\(server.backendHint.displayName)")
         if let existing = connections[server.id] {
             // Replace stale connection records when SSH startup chose a new port/host.
             if !targetsMatch(existing.target, target) {
+                await DebugLog.shared.log("addServer replace existing serverId=\(server.id)")
                 existing.disconnect()
                 connections.removeValue(forKey: server.id)
             } else {
@@ -105,6 +138,13 @@ final class ServerManager: ObservableObject {
         threads = threads.filter { $0.key.serverId != id }
         if activeThreadKey?.serverId == id {
             activeThreadKey = nil
+        }
+        let initialCount = agentDirectoryByThread.count + agentDirectoryByAgent.count
+        agentDirectoryByThread = agentDirectoryByThread.filter { $0.value.serverId != id }
+        agentDirectoryByAgent = agentDirectoryByAgent.filter { $0.value.serverId != id }
+        let finalCount = agentDirectoryByThread.count + agentDirectoryByAgent.count
+        if finalCount != initialCount {
+            agentDirectoryVersion = agentDirectoryVersion &+ 1
         }
         saveServerList()
     }
@@ -227,10 +267,21 @@ final class ServerManager: ObservableObject {
 
     // MARK: - Thread Lifecycle
 
-    func startThread(serverId: String, cwd: String, model: String? = nil) async -> ThreadKey? {
+    func startThread(
+        serverId: String,
+        cwd: String,
+        model: String? = nil,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async -> ThreadKey? {
         guard let conn = connections[serverId] else { return nil }
         do {
-            let resp = try await conn.startThread(cwd: cwd, model: model)
+            let resp = try await conn.startThread(
+                cwd: cwd,
+                model: model,
+                approvalPolicy: approvalPolicy,
+                sandboxMode: sandboxMode
+            )
             let threadId = resp.thread.id
             let key = ThreadKey(serverId: serverId, threadId: threadId)
             let state = ThreadState(
@@ -240,10 +291,22 @@ final class ServerManager: ObservableObject {
                 serverSource: conn.server.source
             )
             state.cwd = cwd
-            state.modelProvider = Self.providerFor(conn.serverType)
+            state.modelProvider = resp.modelProvider ?? Self.providerFor(conn.serverType)
+            state.parentThreadId = resp.thread.parentThreadId
+            state.rootThreadId = resp.thread.rootThreadId
+            state.agentId = resp.thread.agentId
+            state.agentNickname = resp.thread.agentNickname
+            state.agentRole = resp.thread.agentRole
             state.updatedAt = Date()
             threads[key] = state
             observeThread(state)
+            upsertAgentDirectory(
+                serverId: serverId,
+                threadId: threadId,
+                agentId: state.agentId,
+                nickname: state.agentNickname,
+                role: state.agentRole
+            )
             activeThreadKey = key
             return key
         } catch {
@@ -251,7 +314,13 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    func resumeThread(serverId: String, threadId: String, cwd: String) async -> Bool {
+    func resumeThread(
+        serverId: String,
+        threadId: String,
+        cwd: String,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async -> Bool {
         guard let conn = connections[serverId] else { return false }
         let key = ThreadKey(serverId: serverId, threadId: threadId)
         let state = threads[key] ?? ThreadState(
@@ -264,12 +333,33 @@ final class ServerManager: ObservableObject {
         threads[key] = state
         observeThread(state)
         do {
-            let resp = try await conn.resumeThread(threadId: threadId, cwd: cwd)
+            let resp = try await conn.resumeThread(
+                threadId: threadId,
+                cwd: cwd,
+                approvalPolicy: approvalPolicy,
+                sandboxMode: sandboxMode
+            )
             state.messages = restoredMessages(from: resp.thread.turns)
             state.cwd = cwd
-            state.modelProvider = Self.providerFor(conn.serverType)
+            state.modelProvider = resp.modelProvider ?? Self.providerFor(conn.serverType)
+            state.parentThreadId = resp.thread.parentThreadId
+            state.rootThreadId = resp.thread.rootThreadId
+            state.agentId = resp.thread.agentId
+            state.agentNickname = resp.thread.agentNickname
+            state.agentRole = resp.thread.agentRole
+            if let last = state.messages.last(where: { $0.role == .assistant })?.text ??
+                state.messages.last?.text {
+                state.preview = last
+            }
             state.status = .ready
             state.updatedAt = Date()
+            upsertAgentDirectory(
+                serverId: serverId,
+                threadId: threadId,
+                agentId: state.agentId,
+                nickname: state.agentNickname,
+                role: state.agentRole
+            )
             activeThreadKey = key
             return true
         } catch {
@@ -278,33 +368,205 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    func viewThread(_ key: ThreadKey) async {
+    func viewThread(
+        _ key: ThreadKey,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async {
         if threads[key]?.messages.isEmpty == true {
             let cwd = threads[key]?.cwd ?? "/tmp"
-            _ = await resumeThread(serverId: key.serverId, threadId: key.threadId, cwd: cwd)
+            _ = await resumeThread(
+                serverId: key.serverId,
+                threadId: key.threadId,
+                cwd: cwd,
+                approvalPolicy: approvalPolicy,
+                sandboxMode: sandboxMode
+            )
         } else {
             activeThreadKey = key
         }
     }
 
+    func forkThread(
+        _ key: ThreadKey,
+        cwd: String? = nil,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async -> ThreadKey? {
+        guard let conn = connections[key.serverId], conn.isConnected else { return nil }
+        do {
+            let response = try await conn.forkThread(
+                threadId: key.threadId,
+                cwd: cwd,
+                approvalPolicy: approvalPolicy,
+                sandboxMode: sandboxMode
+            )
+            let forkedId = response.thread.id
+            let forkedKey = ThreadKey(serverId: key.serverId, threadId: forkedId)
+            let state = ThreadState(
+                serverId: key.serverId,
+                threadId: forkedId,
+                serverName: conn.server.name,
+                serverSource: conn.server.source
+            )
+            let sourceCwd = cwd ?? threads[key]?.cwd ?? response.cwd
+            state.cwd = sourceCwd
+            state.modelProvider = response.modelProvider ?? Self.providerFor(conn.serverType)
+            state.messages = restoredMessages(from: response.thread.turns)
+            state.parentThreadId = response.thread.parentThreadId
+            state.rootThreadId = response.thread.rootThreadId
+            state.agentId = response.thread.agentId
+            state.agentNickname = response.thread.agentNickname
+            state.agentRole = response.thread.agentRole
+            if let preview = state.messages.last(where: { $0.role == .assistant })?.text ?? state.messages.last?.text {
+                state.preview = preview
+            }
+            state.status = .ready
+            state.updatedAt = Date()
+            threads[forkedKey] = state
+            observeThread(state)
+            upsertAgentDirectory(
+                serverId: key.serverId,
+                threadId: forkedId,
+                agentId: state.agentId,
+                nickname: state.agentNickname,
+                role: state.agentRole
+            )
+            activeThreadKey = forkedKey
+            return forkedKey
+        } catch {
+            return nil
+        }
+    }
+
+    func rollbackThread(_ key: ThreadKey, numTurns: Int) async -> Bool {
+        guard let conn = connections[key.serverId], conn.isConnected, let thread = threads[key] else { return false }
+        do {
+            let response = try await conn.rollbackThread(threadId: key.threadId, numTurns: numTurns)
+            thread.messages = restoredMessages(from: response.thread.turns)
+            thread.cwd = response.cwd ?? thread.cwd
+            thread.parentThreadId = response.thread.parentThreadId
+            thread.rootThreadId = response.thread.rootThreadId
+            thread.agentId = response.thread.agentId ?? thread.agentId
+            thread.agentNickname = response.thread.agentNickname ?? thread.agentNickname
+            thread.agentRole = response.thread.agentRole ?? thread.agentRole
+            thread.updatedAt = Date()
+            thread.status = .ready
+            if let preview = thread.messages.last(where: { $0.role == .assistant })?.text ?? thread.messages.last?.text {
+                thread.preview = preview
+            }
+            upsertAgentDirectory(
+                serverId: key.serverId,
+                threadId: key.threadId,
+                agentId: thread.agentId,
+                nickname: thread.agentNickname,
+                role: thread.agentRole
+            )
+            return true
+        } catch {
+            thread.status = .error(error.localizedDescription)
+            return false
+        }
+    }
+
+    func archiveThread(_ key: ThreadKey) async -> Bool {
+        guard let conn = connections[key.serverId], conn.isConnected else { return false }
+        do {
+            try await conn.archiveThread(threadId: key.threadId)
+            threadSubscriptions.removeValue(forKey: key)
+            threads.removeValue(forKey: key)
+            if activeThreadKey == key {
+                activeThreadKey = sortedThreads.first?.key
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     // MARK: - Send / Interrupt
 
-    func send(_ text: String, cwd: String, model: String? = nil, effort: String? = nil) async {
+    func send(
+        _ text: String,
+        additionalInput: [UserInput] = [],
+        cwd: String,
+        model: String? = nil,
+        effort: String? = nil,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async {
         var key = activeThreadKey
         if key == nil {
             if let serverId = connections.values.first(where: { $0.isConnected })?.id {
-                key = await startThread(serverId: serverId, cwd: cwd, model: model)
+                key = await startThread(
+                    serverId: serverId,
+                    cwd: cwd,
+                    model: model,
+                    approvalPolicy: approvalPolicy,
+                    sandboxMode: sandboxMode
+                )
             }
         }
         guard let key, let thread = threads[key], let conn = connections[key.serverId] else { return }
-        thread.messages.append(ChatMessage(role: .user, text: text))
+        let localUserMessage = localUserMessage(from: text, additionalInput: additionalInput)
+        thread.messages.append(localUserMessage)
+        thread.preview = localUserMessage.text
+        thread.cwd = cwd
         thread.status = .thinking
         thread.updatedAt = Date()
         do {
-            try await conn.sendTurn(threadId: key.threadId, text: text, model: model, effort: effort)
+            try await conn.sendTurn(
+                threadId: key.threadId,
+                text: text,
+                model: model,
+                effort: effort,
+                additionalInput: additionalInput
+            )
         } catch {
             thread.status = .error(error.localizedDescription)
         }
+    }
+
+    private func localUserMessage(from text: String, additionalInput: [UserInput]) -> ChatMessage {
+        var displayText = text
+        var images: [ChatImage] = []
+        var attachmentLines: [String] = []
+
+        for input in additionalInput {
+            switch input.type {
+            case "localImage":
+                if let path = input.path,
+                   let data = FileManager.default.contents(atPath: path) {
+                    images.append(ChatImage(data: data))
+                }
+                let displayName = sanitizedLineageId(input.name)
+                    ?? sanitizedLineageId(input.path.map { URL(fileURLWithPath: $0).lastPathComponent })
+                if let displayName {
+                    attachmentLines.append("[Image] \(displayName)")
+                }
+            case "mention":
+                let name = sanitizedLineageId(input.name)
+                let path = sanitizedLineageId(input.path)
+                if let name, let path {
+                    attachmentLines.append("[File] \(name) (\(path))")
+                } else if let name {
+                    attachmentLines.append("[File] \(name)")
+                } else if let path {
+                    attachmentLines.append("[File] \(path)")
+                }
+            default:
+                break
+            }
+        }
+
+        if !attachmentLines.isEmpty {
+            if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                displayText += "\n"
+            }
+            displayText += attachmentLines.joined(separator: "\n")
+        }
+
+        return ChatMessage(role: .user, text: displayText, images: images)
     }
 
     func interrupt() async {
@@ -325,17 +587,40 @@ final class ServerManager: ObservableObject {
         }
     }
 
+    /// Poll-based reconciliation for cross-client activity where notifications are missing or incomplete.
+    func performLiveSyncPass() async {
+        guard !liveSyncInProgress else { return }
+        liveSyncInProgress = true
+        defer { liveSyncInProgress = false }
+
+        await refreshAllSessions()
+        await refreshActiveThreadSnapshotIfNeeded()
+    }
+
     func refreshSessions(for serverId: String) async {
         guard let conn = connections[serverId], conn.isConnected else { return }
         do {
             let resp = try await conn.listThreads()
+            await DebugLog.shared.log("refreshSessions serverId=\(serverId) serverType=\(conn.serverType.displayName) threadCount=\(resp.data.count)")
             for summary in resp.data {
                 let key = ThreadKey(serverId: serverId, threadId: summary.id)
                 if let existing = threads[key] {
                     existing.preview = summary.preview
                     existing.cwd = summary.cwd
                     existing.modelProvider = summary.modelProvider
+                    existing.parentThreadId = summary.parentThreadId
+                    existing.rootThreadId = summary.rootThreadId
+                    existing.agentId = summary.agentId ?? existing.agentId
+                    existing.agentNickname = summary.agentNickname ?? existing.agentNickname
+                    existing.agentRole = summary.agentRole ?? existing.agentRole
                     existing.updatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
+                    upsertAgentDirectory(
+                        serverId: serverId,
+                        threadId: summary.id,
+                        agentId: existing.agentId,
+                        nickname: existing.agentNickname,
+                        role: existing.agentRole
+                    )
                 } else {
                     let state = ThreadState(
                         serverId: serverId,
@@ -346,12 +631,32 @@ final class ServerManager: ObservableObject {
                     state.preview = summary.preview
                     state.cwd = summary.cwd
                     state.modelProvider = summary.modelProvider
+                    state.parentThreadId = summary.parentThreadId
+                    state.rootThreadId = summary.rootThreadId
+                    state.agentId = summary.agentId
+                    state.agentNickname = summary.agentNickname
+                    state.agentRole = summary.agentRole
                     state.updatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
                     threads[key] = state
                     observeThread(state)
+                    upsertAgentDirectory(
+                        serverId: serverId,
+                        threadId: summary.id,
+                        agentId: state.agentId,
+                        nickname: state.agentNickname,
+                        role: state.agentRole
+                    )
                 }
             }
-        } catch {}
+        } catch {
+            NSLog(
+                "[SERVER_MANAGER] refreshSessions failed for %@ (%@): %@",
+                serverId,
+                conn.serverType.displayName,
+                error.localizedDescription
+            )
+            await DebugLog.shared.log("refreshSessions failed serverId=\(serverId) serverType=\(conn.serverType.displayName) error=\(error.localizedDescription)")
+        }
     }
 
     // MARK: - Notification Routing
@@ -364,28 +669,106 @@ final class ServerManager: ObservableObject {
         case "turn/started":
             if let threadId = extractThreadId(from: data) {
                 let key = ThreadKey(serverId: serverId, threadId: threadId)
-                threads[key]?.status = .thinking
+                if let thread = ensureThreadState(for: key) {
+                    thread.status = .thinking
+                    thread.updatedAt = Date()
+                }
+                scheduleSessionRefresh(for: serverId)
             }
 
         case "item/agentMessage/delta":
-            struct DeltaParams: Decodable { let delta: String; let threadId: String? }
+            struct DeltaParams: Decodable {
+                let delta: String
+                let threadId: String?
+                let agentId: String?
+                let agentNickname: String?
+                let agentRole: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case delta
+                    case threadId
+                    case threadIdSnake = "thread_id"
+                    case agentId
+                    case agentIdSnake = "agent_id"
+                    case agentNickname
+                    case agentNicknameSnake = "agent_nickname"
+                    case nickname
+                    case agentRole
+                    case agentRoleSnake = "agent_role"
+                    case agentType
+                    case agentTypeSnake = "agent_type"
+                }
+
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    delta = (try? container.decode(String.self, forKey: .delta)) ?? ""
+                    threadId = (try? container.decodeIfPresent(String.self, forKey: .threadId))
+                        ?? (try? container.decodeIfPresent(String.self, forKey: .threadIdSnake))
+                    agentId = (try? container.decodeIfPresent(String.self, forKey: .agentId))
+                        ?? (try? container.decodeIfPresent(String.self, forKey: .agentIdSnake))
+                    agentNickname = (try? container.decodeIfPresent(String.self, forKey: .agentNickname))
+                        ?? (try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake))
+                        ?? (try? container.decodeIfPresent(String.self, forKey: .nickname))
+                    let agentRoleValue = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+                    let agentRoleSnakeValue = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+                    let agentTypeValue = try? container.decodeIfPresent(String.self, forKey: .agentType)
+                    let agentTypeSnakeValue = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+                    agentRole = agentRoleValue ?? agentRoleSnakeValue ?? agentTypeValue ?? agentTypeSnakeValue
+                }
+            }
             struct DeltaNotif: Decodable { let params: DeltaParams }
             guard let notif = try? JSONDecoder().decode(DeltaNotif.self, from: data),
                   !notif.params.delta.isEmpty else { return }
             let key = resolveThreadKey(serverId: serverId, threadId: notif.params.threadId)
-            guard let thread = threads[key] else { return }
+            guard !key.threadId.isEmpty, let thread = ensureThreadState(for: key) else { return }
+            let nickname = sanitizedLineageId(notif.params.agentNickname) ?? thread.agentNickname
+            let role = sanitizedLineageId(notif.params.agentRole) ?? thread.agentRole
+            let agentId = sanitizedLineageId(notif.params.agentId) ?? thread.agentId
             if let last = thread.messages.last, last.role == .assistant {
                 thread.messages[thread.messages.count - 1].text += notif.params.delta
+                if thread.messages[thread.messages.count - 1].agentNickname == nil {
+                    thread.messages[thread.messages.count - 1].agentNickname = nickname
+                }
+                if thread.messages[thread.messages.count - 1].agentRole == nil {
+                    thread.messages[thread.messages.count - 1].agentRole = role
+                }
+                if thread.messages[thread.messages.count - 1].agentId == nil {
+                    thread.messages[thread.messages.count - 1].agentId = agentId
+                }
+                thread.preview = thread.messages[thread.messages.count - 1].text
             } else {
-                thread.messages.append(ChatMessage(role: .assistant, text: notif.params.delta))
+                thread.messages.append(
+                    ChatMessage(
+                        role: .assistant,
+                        text: notif.params.delta,
+                        agentId: agentId,
+                        agentNickname: nickname,
+                        agentRole: role
+                    )
+                )
+                thread.preview = notif.params.delta
             }
+            thread.agentId = agentId ?? thread.agentId
+            thread.agentNickname = nickname ?? thread.agentNickname
+            thread.agentRole = role ?? thread.agentRole
+            upsertAgentDirectory(
+                serverId: serverId,
+                threadId: key.threadId,
+                agentId: thread.agentId,
+                nickname: thread.agentNickname,
+                role: thread.agentRole
+            )
             thread.updatedAt = Date()
+            scheduleSessionRefresh(for: serverId)
 
         case "turn/completed", "codex/event/task_complete":
             if let threadId = extractThreadId(from: data) {
                 let key = ThreadKey(serverId: serverId, threadId: threadId)
-                threads[key]?.status = .ready
-                threads[key]?.updatedAt = Date()
+                if let thread = ensureThreadState(for: key) {
+                    thread.status = .ready
+                    thread.updatedAt = Date()
+                }
+                scheduleSessionRefresh(for: serverId)
             } else {
                 // Fallback: mark any thinking thread on this server as ready
                 for (_, thread) in threads where thread.serverId == serverId && thread.hasTurnActive {
@@ -408,40 +791,152 @@ final class ServerManager: ObservableObject {
         guard let raw = try? JSONDecoder().decode(ItemNotification.self, from: data),
               let paramsDict = raw.params?.value as? [String: Any] else { return }
 
-        let threadId = paramsDict["threadId"] as? String
+        let threadId = extractThreadId(from: data)
 
         // Only show completed items — started has incomplete data and would duplicate
         guard method == "item/completed" else { return }
         guard let itemDict = paramsDict["item"] as? [String: Any] else { return }
 
-        // agentMessage is streamed via delta; userMessage is added locally in send()
+        // agentMessage is streamed via delta.
         if let itemType = itemDict["type"] as? String,
-           itemType == "agentMessage" || itemType == "userMessage" { return }
+           itemType == "agentMessage" { return }
 
         guard let itemData = try? JSONSerialization.data(withJSONObject: itemDict),
               let item = try? JSONDecoder().decode(ResumedThreadItem.self, from: itemData),
               let msg = chatMessage(from: item) else { return }
         let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key] else { return }
-        thread.messages.append(msg)
+        guard !key.threadId.isEmpty, let thread = ensureThreadState(for: key) else { return }
+        if shouldAppendNotificationMessage(msg, to: thread) {
+            thread.messages.append(msg)
+        }
+        if msg.role == .assistant || msg.role == .user {
+            thread.preview = msg.text
+        }
         thread.updatedAt = Date()
+        scheduleSessionRefresh(for: serverId)
     }
 
     private func extractThreadId(from data: Data) -> String? {
-        struct Wrapper: Decodable {
-            struct Params: Decodable { let threadId: String? }
-            let params: Params?
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let params = root["params"] as? [String: Any] else {
+            return nil
         }
-        return (try? JSONDecoder().decode(Wrapper.self, from: data))?.params?.threadId
+
+        if let threadId = sanitizedLineageId((params["threadId"] as? String) ?? (params["thread_id"] as? String)) {
+            return threadId
+        }
+
+        if let item = params["item"] as? [String: Any],
+           let threadId = sanitizedLineageId((item["threadId"] as? String) ?? (item["thread_id"] as? String)) {
+            return threadId
+        }
+        return nil
     }
 
     private func resolveThreadKey(serverId: String, threadId: String?) -> ThreadKey {
-        if let threadId {
+        if let threadId = sanitizedLineageId(threadId) {
             return ThreadKey(serverId: serverId, threadId: threadId)
         }
         return threads.values
             .first { $0.serverId == serverId && $0.hasTurnActive }?
             .key ?? ThreadKey(serverId: serverId, threadId: "")
+    }
+
+    private func refreshActiveThreadSnapshotIfNeeded() async {
+        guard let key = activeThreadKey,
+              let thread = threads[key],
+              !thread.hasTurnActive,
+              let conn = connections[key.serverId],
+              conn.isConnected else {
+            return
+        }
+
+        do {
+            let response = try await conn.syncThreadState(
+                threadId: key.threadId,
+                cwd: thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : thread.cwd
+            )
+            let restored = restoredMessages(from: response.thread.turns)
+            if messagesDiffer(thread.messages, restored) {
+                thread.messages = restored
+                if let preview = restored.last(where: { $0.role == .assistant })?.text ?? restored.last?.text {
+                    thread.preview = preview
+                }
+            }
+
+            let normalizedCwd = response.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalizedCwd.isEmpty {
+                thread.cwd = normalizedCwd
+            }
+            thread.modelProvider = response.modelProvider ?? thread.modelProvider
+            thread.parentThreadId = response.thread.parentThreadId ?? thread.parentThreadId
+            thread.rootThreadId = response.thread.rootThreadId ?? thread.rootThreadId
+            thread.agentId = response.thread.agentId ?? thread.agentId
+            thread.agentNickname = response.thread.agentNickname ?? thread.agentNickname
+            thread.agentRole = response.thread.agentRole ?? thread.agentRole
+            thread.updatedAt = Date()
+            upsertAgentDirectory(
+                serverId: key.serverId,
+                threadId: key.threadId,
+                agentId: thread.agentId,
+                nickname: thread.agentNickname,
+                role: thread.agentRole
+            )
+        } catch {
+            // Ignore sync failures. Live notifications and manual refresh remain available.
+        }
+    }
+
+    private func ensureThreadState(for key: ThreadKey) -> ThreadState? {
+        if let existing = threads[key] {
+            return existing
+        }
+        guard !key.threadId.isEmpty, let conn = connections[key.serverId] else { return nil }
+        let state = ThreadState(
+            serverId: key.serverId,
+            threadId: key.threadId,
+            serverName: conn.server.name,
+            serverSource: conn.server.source
+        )
+        state.modelProvider = Self.providerFor(conn.serverType)
+        state.updatedAt = Date()
+        threads[key] = state
+        observeThread(state)
+        return state
+    }
+
+    private func shouldAppendNotificationMessage(_ message: ChatMessage, to thread: ThreadState) -> Bool {
+        guard let last = thread.messages.last else { return true }
+        if message.role == .user {
+            return !(last.role == .user && last.text == message.text && last.images.count == message.images.count)
+        }
+        return true
+    }
+
+    private func messagesDiffer(_ current: [ChatMessage], _ incoming: [ChatMessage]) -> Bool {
+        guard current.count == incoming.count else { return true }
+        for (lhs, rhs) in zip(current, incoming) {
+            if lhs.role != rhs.role ||
+                lhs.text != rhs.text ||
+                lhs.images.count != rhs.images.count ||
+                lhs.agentId != rhs.agentId ||
+                lhs.agentNickname != rhs.agentNickname ||
+                lhs.agentRole != rhs.agentRole {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func scheduleSessionRefresh(for serverId: String) {
+        let normalized = sanitizedLineageId(serverId) ?? serverId
+        guard scheduledSessionRefreshes.insert(normalized).inserted else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard let self else { return }
+            await self.refreshSessions(for: normalized)
+            self.scheduledSessionRefreshes.remove(normalized)
+        }
     }
 
     static func providerFor(_ serverType: ServerConnection.ServerType) -> String {
@@ -450,6 +945,110 @@ final class ServerManager: ObservableObject {
         case .codex: return "openai"
         case .unknown: return ""
         }
+    }
+
+    func resolvedAgentTargetLabel(for target: String, serverId: String? = nil) -> String? {
+        if AgentLabelFormatter.looksLikeDisplayLabel(target),
+           let label = AgentLabelFormatter.sanitized(target) {
+            return label
+        }
+        guard let normalizedTarget = sanitizedLineageId(target) else { return nil }
+        let scopedServer = sanitizedLineageId(serverId) ?? activeThreadKey?.serverId
+
+        if let scopedServer {
+            let threadKey = "\(scopedServer)|\(normalizedTarget)"
+            if let entry = agentDirectoryByThread[threadKey] {
+                return formatAgentLabel(
+                    nickname: entry.nickname,
+                    role: entry.role,
+                    fallbackIdentifier: entry.threadId ?? entry.agentId ?? normalizedTarget
+                )
+            }
+            let agentKey = "\(scopedServer)|\(normalizedTarget)"
+            if let entry = agentDirectoryByAgent[agentKey] {
+                return formatAgentLabel(
+                    nickname: entry.nickname,
+                    role: entry.role,
+                    fallbackIdentifier: entry.threadId ?? entry.agentId ?? normalizedTarget
+                )
+            }
+        }
+
+        if let threadMatch = threads.values.first(where: { $0.threadId == normalizedTarget || $0.agentId == normalizedTarget }) {
+            return formatAgentLabel(
+                nickname: threadMatch.agentNickname,
+                role: threadMatch.agentRole,
+                fallbackIdentifier: threadMatch.threadId
+            )
+        }
+        return nil
+    }
+
+    private func upsertAgentDirectory(
+        serverId: String?,
+        threadId: String?,
+        agentId: String?,
+        nickname: String?,
+        role: String?
+    ) {
+        guard let normalizedServer = sanitizedLineageId(serverId) else { return }
+        let normalizedThread = sanitizedLineageId(threadId)
+        let normalizedAgent = sanitizedLineageId(agentId)
+        let normalizedNickname = sanitizedLineageId(nickname)
+        let normalizedRole = sanitizedLineageId(role)
+        guard normalizedThread != nil || normalizedAgent != nil || normalizedNickname != nil || normalizedRole != nil else { return }
+
+        let entry = AgentDirectoryEntry(
+            serverId: normalizedServer,
+            threadId: normalizedThread,
+            agentId: normalizedAgent,
+            nickname: normalizedNickname,
+            role: normalizedRole
+        )
+        var changed = false
+        if let normalizedThread {
+            let key = "\(normalizedServer)|\(normalizedThread)"
+            if agentDirectoryByThread[key]?.nickname != entry.nickname ||
+                agentDirectoryByThread[key]?.role != entry.role ||
+                agentDirectoryByThread[key]?.agentId != entry.agentId {
+                agentDirectoryByThread[key] = entry
+                changed = true
+            }
+        }
+        if let normalizedAgent {
+            let key = "\(normalizedServer)|\(normalizedAgent)"
+            if agentDirectoryByAgent[key]?.nickname != entry.nickname ||
+                agentDirectoryByAgent[key]?.role != entry.role ||
+                agentDirectoryByAgent[key]?.threadId != entry.threadId {
+                agentDirectoryByAgent[key] = entry
+                changed = true
+            }
+        }
+        if changed {
+            agentDirectoryVersion = agentDirectoryVersion &+ 1
+        }
+    }
+
+    private func formatAgentLabel(nickname: String?, role: String?, fallbackIdentifier: String?) -> String {
+        let cleanNickname = sanitizedLineageId(nickname)
+        let cleanRole = sanitizedLineageId(role)
+        switch (cleanNickname, cleanRole) {
+        case let (nickname?, role?):
+            return "\(nickname) [\(role)]"
+        case let (nickname?, nil):
+            return nickname
+        case let (nil, role?):
+            return "\(role) agent"
+        default:
+            return sanitizedLineageId(fallbackIdentifier) ?? "Unknown"
+        }
+    }
+
+    private func sanitizedLineageId(_ value: String?) -> String? {
+        guard let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines), !cleaned.isEmpty else {
+            return nil
+        }
+        return cleaned
     }
 
     // MARK: - MCP Servers
@@ -854,10 +1453,19 @@ final class ServerManager: ObservableObject {
             let (text, images) = renderUserInput(content)
             if text.isEmpty && images.isEmpty { return nil }
             return ChatMessage(role: .user, text: text, images: images)
-        case .agentMessage(let text, _):
+        case .agentMessage(let text, _, let itemAgentId, let itemAgentNickname, let itemAgentRole):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return nil }
-            return ChatMessage(role: .assistant, text: trimmed)
+            let agentId = sanitizedLineageId(itemAgentId)
+            let nickname = sanitizedLineageId(itemAgentNickname)
+            let role = sanitizedLineageId(itemAgentRole)
+            return ChatMessage(
+                role: .assistant,
+                text: trimmed,
+                agentId: agentId,
+                agentNickname: nickname,
+                agentRole: role
+            )
         case .plan(let text):
             return systemMessage(title: "Plan", body: text.trimmingCharacters(in: .whitespacesAndNewlines))
         case .reasoning(let summary, let content):
@@ -917,10 +1525,39 @@ final class ServerManager: ObservableObject {
                 }
             }
             return systemMessage(title: "MCP Tool Call", body: body)
-        case .collabAgentToolCall(let tool, let status, let receiverThreadIds, let prompt):
+        case .collabAgentToolCall(let tool, let status, let receiverThreadIds, let receiverAgents, let prompt):
             var lines: [String] = ["Status: \(status)", "Tool: \(tool)"]
-            if !receiverThreadIds.isEmpty {
-                lines.append("Targets: \(receiverThreadIds.joined(separator: ", "))")
+            var labels: [String] = []
+            if !receiverThreadIds.isEmpty || !receiverAgents.isEmpty {
+                for target in receiverThreadIds {
+                    let normalized = sanitizedLineageId(target) ?? target
+                    if let resolved = resolvedAgentTargetLabel(for: normalized), !resolved.isEmpty {
+                        labels.append(resolved)
+                    } else {
+                        labels.append(normalized)
+                    }
+                }
+                for ref in receiverAgents where (sanitizedLineageId(ref.threadId) ?? sanitizedLineageId(ref.agentId)) != nil {
+                    let id = sanitizedLineageId(ref.threadId) ?? sanitizedLineageId(ref.agentId) ?? ""
+                    if !labels.contains(where: { $0 == id || $0.hasPrefix(id + " ") }) {
+                        let label = formatAgentLabel(
+                            nickname: sanitizedLineageId(ref.agentNickname),
+                            role: sanitizedLineageId(ref.agentRole),
+                            fallbackIdentifier: id
+                        )
+                        labels.append(label)
+                    }
+                    upsertAgentDirectory(
+                        serverId: activeThreadKey?.serverId,
+                        threadId: sanitizedLineageId(ref.threadId),
+                        agentId: sanitizedLineageId(ref.agentId),
+                        nickname: sanitizedLineageId(ref.agentNickname),
+                        role: sanitizedLineageId(ref.agentRole)
+                    )
+                }
+            }
+            if !labels.isEmpty {
+                lines.append("Targets: \(labels.joined(separator: ", "))")
             }
             if let prompt {
                 let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)

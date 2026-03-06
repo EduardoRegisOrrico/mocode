@@ -21,5 +21,10 @@ Packages/
 *.log
 *.tmp
 
+# Local workspace/tooling state
+.claude/
+.derived/
+.DerivedData/
+
 # Local screenshots
 Simulator Screenshot*.png

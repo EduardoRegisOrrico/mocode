@@ -1143,7 +1143,7 @@ fn canonical_key(path: &Path) -> String {
 }
 
 async fn handle_thread_list(state: Arc<AppState>, _params: Value) -> Result<Value, (i64, String)> {
-    let data: Vec<Value> = state
+    let mut data: Vec<Value> = state
         .sessions
         .list_threads()
         .await
@@ -1169,7 +1169,379 @@ async fn handle_thread_list(state: Arc<AppState>, _params: Value) -> Result<Valu
         })
         .collect();
 
+    // Merge native Claude CLI sessions from ~/.claude/projects/
+    let app_session_ids: std::collections::HashSet<String> = data
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str).map(String::from))
+        .collect();
+    let cli_sessions = scan_claude_cli_sessions();
+    for session in cli_sessions {
+        let id = session
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // Skip sessions already managed by the app-server.
+        if !id.is_empty() && !app_session_ids.contains(id) {
+            data.push(session);
+        }
+    }
+
+    // Sort by updatedAt descending.
+    data.sort_by(|a, b| {
+        let a_ts = a.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        let b_ts = b.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+
     Ok(json!({ "data": data, "nextCursor": Value::Null }))
+}
+
+/// Import a CLI session into the app-server's session store so it can be
+/// resumed and continued. The `claude_session_id` is set to the original CLI
+/// session UUID so that `claude --resume <id>` picks up the conversation.
+async fn import_cli_session_if_needed(
+    state: Arc<AppState>,
+    thread_id: &str,
+) -> Result<(), (i64, String)> {
+    // Already imported?
+    if state.sessions.get_thread(thread_id).await.is_some() {
+        return Ok(());
+    }
+
+    let cli_session_id = thread_id
+        .strip_prefix("cli_")
+        .ok_or((-32004, "invalid CLI thread id".to_string()))?;
+
+    // Find the JSONL file.
+    let home = std::env::var("HOME").map_err(|_| (-32004, "HOME not set".to_string()))?;
+    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let jsonl_path = find_cli_session_file(&projects_dir, cli_session_id)
+        .ok_or((-32004, format!("CLI session file not found: {cli_session_id}")))?;
+
+    // Parse messages from the JSONL.
+    let file = std::fs::File::open(&jsonl_path)
+        .map_err(|e| (-32004, format!("cannot open session file: {e}")))?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut messages = Vec::new();
+    let mut cwd = String::new();
+    let mut first_timestamp = String::new();
+    let mut last_timestamp = String::new();
+    let mut title = String::new();
+
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if let Some(ts) = entry.get("timestamp").and_then(Value::as_str) {
+            if first_timestamp.is_empty() {
+                first_timestamp = ts.to_string();
+            }
+            last_timestamp = ts.to_string();
+        }
+
+        match entry_type {
+            "user" => {
+                if cwd.is_empty() {
+                    if let Some(c) = entry.get("cwd").and_then(Value::as_str) {
+                        cwd = c.to_string();
+                    }
+                }
+                if let Some(text) = extract_first_text_from_message(&entry) {
+                    if title.is_empty() {
+                        title = text.chars().take(80).collect();
+                    }
+                    let ts = entry
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    messages.push(PersistedMessage {
+                        role: "user".to_string(),
+                        text,
+                        created_at: ts,
+                    });
+                }
+            }
+            "assistant" => {
+                if let Some(text) = extract_first_text_from_message(&entry) {
+                    let ts = entry
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    messages.push(PersistedMessage {
+                        role: "assistant".to_string(),
+                        text,
+                        created_at: ts,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if cwd.is_empty() {
+        cwd = "/".to_string();
+    }
+    if title.is_empty() {
+        title = "Imported CLI Session".to_string();
+    }
+
+    let now = if last_timestamp.is_empty() {
+        now_iso8601()
+    } else {
+        last_timestamp
+    };
+    let created = if first_timestamp.is_empty() {
+        now_iso8601()
+    } else {
+        first_timestamp
+    };
+
+    let entry = ThreadEntry {
+        claude_session_id: cli_session_id.to_string(),
+        cwd,
+        created_at: created,
+        title,
+        updated_at: now,
+        started: true,
+        messages,
+    };
+
+    state
+        .sessions
+        .upsert_thread(thread_id.to_string(), entry)
+        .await;
+    let _ = state.sessions.flush().await;
+
+    Ok(())
+}
+
+/// Find a CLI session JSONL file by its UUID across all project directories.
+fn find_cli_session_file(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let filename = format!("{session_id}.jsonl");
+    let Ok(entries) = std::fs::read_dir(projects_dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(&filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Scan ~/.claude/projects/ for native Claude CLI sessions (JSONL files).
+/// Returns a Vec of thread summary JSON values compatible with the thread/list response.
+fn scan_claude_cli_sessions() -> Vec<Value> {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return vec![],
+    };
+    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return vec![];
+    };
+
+    let mut results = Vec::new();
+
+    for project_entry in project_entries.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let project_name = project_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // Decode the project directory name back to a path (e.g. "-workspace-foo" → "/workspace/foo").
+        let cwd_from_dir = project_name.replacen('-', "/", 1).replace('-', "/");
+
+        let Ok(session_files) = std::fs::read_dir(&project_path) else {
+            continue;
+        };
+
+        for file_entry in session_files.flatten() {
+            let file_path = file_entry.path();
+            let ext = file_path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy();
+            if ext != "jsonl" {
+                continue;
+            }
+            // Skip subagent directories.
+            if file_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n == "subagents")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let session_id = file_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            if let Some(summary) =
+                parse_cli_session_file(&file_path, &session_id, &cwd_from_dir)
+            {
+                results.push(summary);
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse a single Claude CLI JSONL session file and extract a thread summary.
+fn parse_cli_session_file(path: &Path, session_id: &str, default_cwd: &str) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut cwd = String::new();
+    let mut slug = String::new();
+    let mut first_user_text = String::new();
+    let mut last_assistant_text = String::new();
+    let mut first_timestamp = String::new();
+    let mut last_timestamp = String::new();
+
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if let Some(ts) = entry.get("timestamp").and_then(Value::as_str) {
+            if first_timestamp.is_empty() {
+                first_timestamp = ts.to_string();
+            }
+            last_timestamp = ts.to_string();
+        }
+
+        match entry_type {
+            "user" => {
+                if cwd.is_empty() {
+                    if let Some(c) = entry.get("cwd").and_then(Value::as_str) {
+                        cwd = c.to_string();
+                    }
+                }
+                if slug.is_empty() {
+                    if let Some(s) = entry.get("slug").and_then(Value::as_str) {
+                        slug = s.to_string();
+                    }
+                }
+                if first_user_text.is_empty() {
+                    if let Some(text) = extract_first_text_from_message(&entry) {
+                        first_user_text = text;
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(text) = extract_first_text_from_message(&entry) {
+                    last_assistant_text = text;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Skip sessions with no messages.
+    if first_user_text.is_empty() && last_assistant_text.is_empty() {
+        return None;
+    }
+
+    let preview = if !last_assistant_text.is_empty() {
+        last_assistant_text.chars().take(200).collect::<String>()
+    } else {
+        first_user_text.chars().take(200).collect::<String>()
+    };
+
+    if cwd.is_empty() {
+        cwd = default_cwd.to_string();
+    }
+
+    let created_at = parse_iso_to_unix_or_now(&first_timestamp);
+    let updated_at = if last_timestamp.is_empty() {
+        // Fall back to file modification time.
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+            .unwrap_or(created_at)
+    } else {
+        parse_iso_to_unix_or_now(&last_timestamp)
+    };
+
+    Some(json!({
+        "id": format!("cli_{session_id}"),
+        "preview": preview,
+        "modelProvider": "anthropic",
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "cwd": cwd,
+        "cliVersion": "claude-cli"
+    }))
+}
+
+/// Extract the first text content block from a user or assistant JSONL entry.
+fn extract_first_text_from_message(entry: &Value) -> Option<String> {
+    let content = entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)?;
+    for block in content {
+        if let Some(obj) = block.as_object() {
+            if obj.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn handle_thread_start(state: Arc<AppState>, params: Value) -> Result<Value, (i64, String)> {
@@ -1218,6 +1590,11 @@ async fn handle_thread_resume(state: Arc<AppState>, params: Value) -> Result<Val
         .and_then(Value::as_str)
         .ok_or((-32602, "threadId is required".to_string()))?;
 
+    // If this is a CLI session, import it into the app-server store first.
+    if thread_id.starts_with("cli_") {
+        import_cli_session_if_needed(state.clone(), thread_id).await?;
+    }
+
     let entry = state
         .sessions
         .get_thread(thread_id)
@@ -1261,6 +1638,11 @@ async fn handle_turn_start(state: Arc<AppState>, params: Value) -> Result<Value,
         .and_then(Value::as_str)
         .ok_or((-32602, "threadId is required".to_string()))?
         .to_string();
+
+    // If this is a CLI session, import it into the app-server store first.
+    if thread_id.starts_with("cli_") {
+        import_cli_session_if_needed(state.clone(), &thread_id).await?;
+    }
 
     let thread = state
         .sessions
@@ -1429,20 +1811,78 @@ fn parse_iso_to_unix_or_now(value: &str) -> i64 {
 }
 
 fn try_parse_iso(value: &str) -> Option<i64> {
-    // Very small parser for format: YYYY-MM-DDTHH:MM:SSZ
-    if value.len() < 20 {
+    let trimmed = value.trim();
+    let t_index = trimmed.find('T')?;
+    let date_part = trimmed.get(..t_index)?;
+    let time_and_tz = trimmed.get(t_index + 1..)?;
+
+    let mut date_iter = date_part.split('-');
+    let year: i32 = date_iter.next()?.parse().ok()?;
+    let month: u32 = date_iter.next()?.parse().ok()?;
+    let day: u32 = date_iter.next()?.parse().ok()?;
+    if date_iter.next().is_some() {
         return None;
     }
-    let year: i32 = value.get(0..4)?.parse().ok()?;
-    let month: u32 = value.get(5..7)?.parse().ok()?;
-    let day: u32 = value.get(8..10)?.parse().ok()?;
-    let hour: u32 = value.get(11..13)?.parse().ok()?;
-    let minute: u32 = value.get(14..16)?.parse().ok()?;
-    let second: u32 = value.get(17..19)?.parse().ok()?;
-    if value.get(19..20)? != "Z" && !value.ends_with('Z') {
+
+    let tz_start = time_and_tz
+        .find(['Z', '+', '-'])
+        .unwrap_or(time_and_tz.len());
+    let time_part = time_and_tz.get(..tz_start)?;
+    let tz_part = time_and_tz.get(tz_start..).unwrap_or("Z");
+
+    let mut time_iter = time_part.split(':');
+    let hour: u32 = time_iter.next()?.parse().ok()?;
+    let minute: u32 = time_iter.next()?.parse().ok()?;
+    let second_raw = time_iter.next()?;
+    let second_digits: String = second_raw
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let second: u32 = second_digits.parse().ok()?;
+    if time_iter.next().is_some() {
         return None;
     }
-    datetime_to_unix(year, month, day, hour, minute, second)
+
+    let local_unix = datetime_to_unix(year, month, day, hour, minute, second)?;
+    let offset_seconds = parse_iso_offset_seconds(tz_part)?;
+    Some(local_unix - offset_seconds)
+}
+
+fn parse_iso_offset_seconds(raw: &str) -> Option<i64> {
+    if raw.is_empty() || raw == "Z" {
+        return Some(0);
+    }
+
+    let sign = match raw.chars().next()? {
+        '+' => 1i64,
+        '-' => -1i64,
+        _ => return None,
+    };
+    let body = raw.get(1..)?;
+    if body.is_empty() {
+        return None;
+    }
+
+    let (hours, minutes) = if let Some((h, m)) = body.split_once(':') {
+        let hours: i64 = h.parse().ok()?;
+        let minutes: i64 = m.parse().ok()?;
+        (hours, minutes)
+    } else if body.len() == 4 {
+        let hours: i64 = body.get(..2)?.parse().ok()?;
+        let minutes: i64 = body.get(2..)?.parse().ok()?;
+        (hours, minutes)
+    } else if body.len() == 2 {
+        let hours: i64 = body.parse().ok()?;
+        (hours, 0)
+    } else {
+        return None;
+    };
+
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+
+    Some(sign * ((hours * 60 + minutes) * 60))
 }
 
 fn datetime_to_unix(

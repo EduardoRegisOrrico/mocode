@@ -4,12 +4,18 @@ import Inject
 
 struct MessageBubbleView: View {
     @ObserveInjection var inject
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var serverManager: ServerManager
     let message: ChatMessage
     @ScaledMetric(relativeTo: .body) private var mdBodySize: CGFloat = 14
     @ScaledMetric(relativeTo: .footnote) private var mdCodeSize: CGFloat = 13
     @ScaledMetric(relativeTo: .footnote) private var mdSystemBodySize: CGFloat = 13
     @ScaledMetric(relativeTo: .caption2) private var mdSystemCodeSize: CGFloat = 12
     @State private var expanded = false
+    
+    private var textScale: CGFloat {
+        min(max(appState.chatTextScale, 0.8), 1.8)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -50,7 +56,7 @@ struct MessageBubbleView: View {
             }
             if !message.text.isEmpty {
                 Text(message.text)
-                    .font(.system(size: 16))
+                    .font(.system(size: 16 * textScale))
                     .foregroundColor(.white)
             }
         }
@@ -60,13 +66,45 @@ struct MessageBubbleView: View {
     }
 
     private var assistantBubble: some View {
-        assistantContent
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
-            )
+        VStack(alignment: .leading, spacing: 8) {
+            if let agentLabel = agentDisplayLabel(message) {
+                Text(agentLabel)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(MocodeTheme.textMuted)
+            }
+            assistantContent
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
+    }
+
+    private func agentDisplayLabel(_ message: ChatMessage) -> String? {
+        let nickname = message.agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let role = message.agentRole?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !nickname.isEmpty && !role.isEmpty {
+            return "\(nickname) [\(role)]"
+        }
+        if !nickname.isEmpty {
+            return nickname
+        }
+        return nil
+    }
+
+    private var parsedToolCallResult: ToolCallParseResult {
+        ToolCallMessageParser.parse(
+            message: message,
+            resolveTargetLabel: { target in
+                serverManager.resolvedAgentTargetLabel(
+                    for: target,
+                    serverId: serverManager.activeThreadKey?.serverId
+                )
+            }
+        )
     }
 
     private var assistantContent: some View {
@@ -76,7 +114,7 @@ struct MessageBubbleView: View {
                 switch segment {
                 case .text(let md):
                     Markdown(md)
-                        .markdownTheme(.mocode(bodySize: mdBodySize, codeSize: mdCodeSize))
+                        .markdownTheme(.mocode(bodySize: mdBodySize * textScale, codeSize: mdCodeSize * textScale))
                         .markdownCodeSyntaxHighlighter(.plain)
                         .textSelection(.enabled)
                 case .imageData(let data):
@@ -93,32 +131,16 @@ struct MessageBubbleView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var reasoningContent: some View {
-        let (_, body) = extractSystemTitleAndBody(message.text)
-        return HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "brain.head.profile")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(MocodeTheme.textSecondary)
-                .padding(.top, 2)
-            Text(body)
-                .font(.system(size: 13))
-                .italic()
-                .foregroundColor(MocodeTheme.textSecondary)
-                .textSelection(.enabled)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var isToolCall: Bool {
-        let (title, _) = extractSystemTitleAndBody(message.text)
-        guard let t = title?.lowercased() else { return false }
-        return t.contains("command") || t.contains("file") || t.contains("mcp")
-            || t.contains("web") || t.contains("collab") || t.contains("image")
-    }
-
+    @ViewBuilder
     private var systemBubble: some View {
+        if case .recognized(let model) = parsedToolCallResult {
+            ToolCallCardView(model: model)
+        } else {
+            fallbackSystemBubble
+        }
+    }
+
+    private var fallbackSystemBubble: some View {
         let (title, body) = extractSystemTitleAndBody(message.text)
         let theme = systemTheme(for: title)
         let toolCall = isToolCall
@@ -132,12 +154,12 @@ struct MessageBubbleView: View {
                     .foregroundColor(theme.accent)
                 if toolCall, let summary {
                     Text(summary)
-                        .font(.system(.caption, design: .rounded))
+                        .font(.system(size: 12 * textScale, weight: .regular, design: .rounded))
                         .foregroundColor(MocodeTheme.textSystem)
                         .lineLimit(1)
                 } else if let title {
                     Text(title.uppercased())
-                        .font(.system(.caption2, design: .rounded, weight: .bold))
+                        .font(.system(size: 11 * textScale, weight: .bold, design: .rounded))
                         .foregroundColor(theme.accent)
                 }
                 Spacer()
@@ -155,7 +177,7 @@ struct MessageBubbleView: View {
             // Expanded body
             if !toolCall || expanded {
                 Markdown(body)
-                    .markdownTheme(.mocodeSystem(bodySize: mdSystemBodySize, codeSize: mdSystemCodeSize))
+                    .markdownTheme(.mocodeSystem(bodySize: mdSystemBodySize * textScale, codeSize: mdSystemCodeSize * textScale))
                     .markdownCodeSyntaxHighlighter(.plain)
                     .textSelection(.enabled)
                     .padding(.top, 8)
@@ -164,14 +186,35 @@ struct MessageBubbleView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .glassEffect(.regular.tint(theme.accent.opacity(0.15)), in: .rect(cornerRadius: 12))
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(theme.accent.opacity(0.9))
-                .frame(width: 3)
-                .padding(.vertical, 6)
-        }
+        .systemMessageAccentStrip(theme.accent)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    private var reasoningContent: some View {
+        let (_, body) = extractSystemTitleAndBody(message.text)
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "brain.head.profile")
+                .font(.system(size: 12 * textScale, weight: .medium))
+                .foregroundColor(MocodeTheme.textSecondary)
+                .padding(.top, 2)
+            Text(body)
+                .font(.system(size: 13 * textScale))
+                .italic()
+                .foregroundColor(MocodeTheme.textSecondary)
+                .textSelection(.enabled)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var isToolCall: Bool {
+        let (title, _) = extractSystemTitleAndBody(message.text)
+        guard let t = title?.lowercased() else { return false }
+        return t.contains("command") || t.contains("file") || t.contains("mcp")
+            || t.contains("web") || t.contains("collab") || t.contains("image")
+    }
+
 
     private func compactSummary(title: String?, body: String) -> String {
         guard let title = title?.lowercased() else { return "" }
@@ -361,6 +404,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 #Preview("Assistant Message") {
@@ -374,6 +419,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 #Preview("Assistant Diff") {
@@ -387,6 +434,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 #Preview("System Messages") {
@@ -415,6 +464,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 #Preview("Reasoning Message") {
@@ -428,6 +479,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 #Preview("Conversation") {
@@ -451,6 +504,8 @@ extension CodeSyntaxHighlighter where Self == PlainSyntaxHighlighter {
         .padding()
     }
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(AppState())
+    .environmentObject(ServerManager())
 }
 
 // MARK: - Mocode Markdown Theme

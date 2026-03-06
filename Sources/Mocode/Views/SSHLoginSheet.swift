@@ -213,6 +213,7 @@ struct SSHLoginSheet: View {
         connectedServerHost = nil
 
         Task {
+            await DebugLog.shared.log("ssh connect start server=\(server.hostname) candidates=\(sshCandidates.map { "\($0.host):\($0.port)" }.joined(separator: ","))")
             let ssh = SSHSessionManager.shared
             var lastError: Error?
             var connectedCandidate: SSHHostCandidate?
@@ -227,6 +228,7 @@ struct SSHLoginSheet: View {
                     if !reachable {
                         unreachableCandidates.append("\(host):\(port)")
                         NSLog("[SSH_LOGIN] preflight unreachable %@:%d (%@)", host, port, candidate.source.rawString)
+                        await DebugLog.shared.log("ssh preflight unreachable host=\(host) port=\(port) source=\(candidate.source.rawString)")
                         continue
                     }
                 }
@@ -237,9 +239,11 @@ struct SSHLoginSheet: View {
                     connectedCandidate = candidate
                     connectedServerHost = host
                     NSLog("[SSH_LOGIN] connected %@:%d", host, port)
+                    await DebugLog.shared.log("ssh connected host=\(host) port=\(port)")
                     break
                 } catch {
                     NSLog("[SSH_LOGIN] failed %@:%d — %@", host, port, error.localizedDescription)
+                    await DebugLog.shared.log("ssh failed host=\(host) port=\(port) error=\(error.localizedDescription)")
                     lastError = error
                 }
             }
@@ -259,10 +263,12 @@ struct SSHLoginSheet: View {
             do {
                 let backends = try await ssh.resolveAvailableBackends()
                 NSLog("[SSH_LOGIN] detected backends: %@", backends.map(\.rawValue).joined(separator: ","))
+                await DebugLog.shared.log("ssh detected backends=\(backends.map(\.rawValue).joined(separator: ","))")
 
                 guard !backends.isEmpty else {
                     isProbing = false
                     errorMessage = SSHError.serverBinaryMissing.localizedDescription
+                    await DebugLog.shared.log("ssh detected no backends")
                     return
                 }
 
@@ -294,12 +300,15 @@ struct SSHLoginSheet: View {
         for backend in backends {
             do {
                 NSLog("[SSH_LOGIN] starting backend: %@", backend.rawValue)
+                await DebugLog.shared.log("ssh starting backend=\(backend.rawValue)")
                 let port = try await ssh.startRemoteServer(backend: backend)
                 let target = ConnectionTarget.remote(host: remoteHost, port: port)
                 NSLog("[SSH_LOGIN] backend %@ ready on %@:%d", backend.rawValue, remoteHost, Int(port))
+                await DebugLog.shared.log("ssh backend ready backend=\(backend.rawValue) host=\(remoteHost) port=\(port)")
                 results.append((target, backend))
             } catch {
                 NSLog("[SSH_LOGIN] backend %@ failed: %@", backend.rawValue, error.localizedDescription)
+                await DebugLog.shared.log("ssh backend failed backend=\(backend.rawValue) error=\(error.localizedDescription)")
                 failures.append("\(backend.displayName): \(error.localizedDescription)")
             }
         }

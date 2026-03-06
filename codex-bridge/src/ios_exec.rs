@@ -33,10 +33,15 @@ fn shell_quote(s: &str) -> String {
 pub fn run_command(
     argv: &[String],
     cwd: &Path,
-    _env: &HashMap<String, String>,
+    env: &HashMap<String, String>,
 ) -> (i32, Vec<u8>) {
     let quoted_args: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
-    let cmd = quoted_args.join(" ");
+    let env_prefix = format_env_prefix(env);
+    let cmd = if env_prefix.is_empty() {
+        quoted_args.join(" ")
+    } else {
+        format!("env {env_prefix} {}", quoted_args.join(" "))
+    };
     let Ok(cmd_cstr) = CString::new(cmd) else {
         return (-1, b"invalid command string\n".to_vec());
     };
@@ -66,4 +71,28 @@ pub fn run_command(
     };
 
     (code as i32, output)
+}
+
+fn format_env_prefix(env: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<(&String, &String)> = env
+        .iter()
+        .filter(|(key, _)| valid_env_key(key))
+        .collect();
+    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var serverManager: ServerManager
+    @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var showAccount = false
     @State private var showMcpServers = false
@@ -118,6 +119,29 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Picker("Approval Policy", selection: $appState.approvalPolicy) {
+                        Text("Desktop Default").tag(AppState.desktopDefaultValue)
+                        Text("Never").tag("never")
+                        Text("On Request").tag("on-request")
+                        Text("On Failure").tag("on-failure")
+                        Text("Untrusted").tag("untrusted")
+                    }
+
+                    Picker("Sandbox", selection: $appState.sandboxMode) {
+                        Text("Desktop Default").tag(AppState.desktopDefaultValue)
+                        Text("Workspace Write").tag("workspace-write")
+                        Text("Read Only").tag("read-only")
+                        Text("Danger Full Access").tag("danger-full-access")
+                    }
+                } header: {
+                    Text("Execution Policy")
+                        .foregroundColor(MocodeTheme.textSecondary)
+                } footer: {
+                    Text("Applied to new/resumed/forked sessions and turn execution defaults.")
+                        .font(.system(.caption2, design: .rounded))
+                }
+
+                Section {
                     let groups = connectedServerGroups
                     if groups.isEmpty {
                         Text("No servers connected")
@@ -205,4 +229,5 @@ struct SettingsView: View {
 #Preview("Settings View") {
     SettingsView()
         .environmentObject(ServerManager())
+        .environmentObject(AppState())
 }

@@ -4,13 +4,13 @@ import UIKit
 struct BrandLogo: View {
     var size: CGFloat
 
-    private var bundledLogo: UIImage? {
-        UIImage(named: "brand_logo") ?? UIImage(named: "brand_logo.png")
+    private var logoImage: UIImage? {
+        UIImage(named: "mocode_brand_mark")
     }
 
     var body: some View {
-        if let bundledLogo {
-            Image(uiImage: bundledLogo)
+        if let logoImage {
+            Image(uiImage: logoImage)
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()

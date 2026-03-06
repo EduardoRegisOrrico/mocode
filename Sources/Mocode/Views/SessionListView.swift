@@ -5,6 +5,7 @@ struct SessionListView: View {
     let cwd: String
     var onSessionReady: ((DiscoveredServer, String) -> Void)?
     @EnvironmentObject var serverManager: ServerManager
+    @EnvironmentObject var appState: AppState
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
     @State private var sessions: [ThreadSummary] = []
     @State private var nextCursor: String?
@@ -156,7 +157,13 @@ struct SessionListView: View {
         errorMessage = nil
         resumingThreadId = session.id
         workDir = cwd
-        let success = await serverManager.resumeThread(serverId: server.id, threadId: session.id, cwd: cwd)
+        let success = await serverManager.resumeThread(
+            serverId: server.id,
+            threadId: session.id,
+            cwd: cwd,
+            approvalPolicy: appState.resolvedApprovalPolicy,
+            sandboxMode: appState.resolvedSandboxMode
+        )
         resumingThreadId = nil
         if success {
             if let onSessionReady { onSessionReady(server, cwd) } else { navigateToConversation = true }
@@ -174,7 +181,13 @@ struct SessionListView: View {
         guard !isResuming else { return }
         workDir = cwd
         let model = (serverManager.activeConnection?.models.first(where: { $0.isDefault })?.id)
-        _ = await serverManager.startThread(serverId: server.id, cwd: cwd, model: model)
+        _ = await serverManager.startThread(
+            serverId: server.id,
+            cwd: cwd,
+            model: model,
+            approvalPolicy: appState.resolvedApprovalPolicy,
+            sandboxMode: appState.resolvedSandboxMode
+        )
         if let onSessionReady { onSessionReady(server, cwd) } else { navigateToConversation = true }
     }
 

@@ -94,10 +94,143 @@ struct ThreadStartParams: Encodable {
 struct ThreadStartResponse: Decodable {
     let thread: ThreadInfo
     let model: String
+    let modelProvider: String?
     let cwd: String
 
     struct ThreadInfo: Decodable {
         let id: String
+        let parentThreadId: String?
+        let rootThreadId: String?
+        let agentId: String?
+        let agentNickname: String?
+        let agentRole: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case parentThreadId
+            case parentThreadIdSnake = "parent_thread_id"
+            case forkedFromId
+            case forkedFromIdSnake = "forked_from_id"
+            case rootThreadId
+            case rootThreadIdSnake = "root_thread_id"
+            case agentId
+            case agentIdSnake = "agent_id"
+            case agentNickname
+            case agentNicknameSnake = "agent_nickname"
+            case agentRole
+            case agentRoleSnake = "agent_role"
+            case agentType
+            case agentTypeSnake = "agent_type"
+            case source
+        }
+
+        private struct SourcePayload: Decodable {
+            let threadSpawn: ThreadSpawn?
+
+            private enum CodingKeys: String, CodingKey {
+                case threadSpawn
+                case threadSpawnSnake = "thread_spawn"
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                threadSpawn = (try? container.decodeIfPresent(ThreadSpawn.self, forKey: .threadSpawn))
+                    ?? (try? container.decodeIfPresent(ThreadSpawn.self, forKey: .threadSpawnSnake))
+            }
+        }
+
+        private struct ThreadSpawn: Decodable {
+            let agentId: String?
+            let agentNickname: String?
+            let agentRole: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case agentId
+                case agentIdSnake = "agent_id"
+                case agentNickname
+                case agentNicknameSnake = "agent_nickname"
+                case agentRole
+                case agentRoleSnake = "agent_role"
+                case agentType
+                case agentTypeSnake = "agent_type"
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                let agentIdPrimary = try? container.decodeIfPresent(String.self, forKey: .agentId)
+                let agentIdSnake = try? container.decodeIfPresent(String.self, forKey: .agentIdSnake)
+                agentId = agentIdPrimary ?? agentIdSnake
+
+                let nicknamePrimary = try? container.decodeIfPresent(String.self, forKey: .agentNickname)
+                let nicknameSnake = try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake)
+                agentNickname = nicknamePrimary ?? nicknameSnake
+
+                let rolePrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+                let roleSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+                let roleType = try? container.decodeIfPresent(String.self, forKey: .agentType)
+                let roleTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+                agentRole = rolePrimary ?? roleSnake ?? roleType ?? roleTypeSnake
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+
+            let source = try? container.decodeIfPresent(SourcePayload.self, forKey: .source)
+
+            let parentFromPrimary = try? container.decodeIfPresent(String.self, forKey: .parentThreadId)
+            let parentFromSnake = try? container.decodeIfPresent(String.self, forKey: .parentThreadIdSnake)
+            let parentFromForkCamel = try? container.decodeIfPresent(String.self, forKey: .forkedFromId)
+            let parentFromForkSnake = try? container.decodeIfPresent(String.self, forKey: .forkedFromIdSnake)
+            parentThreadId = Self.sanitized(parentFromPrimary ?? parentFromSnake ?? parentFromForkCamel ?? parentFromForkSnake)
+
+            let rootFromPrimary = try? container.decodeIfPresent(String.self, forKey: .rootThreadId)
+            let rootFromSnake = try? container.decodeIfPresent(String.self, forKey: .rootThreadIdSnake)
+            rootThreadId = Self.sanitized(rootFromPrimary ?? rootFromSnake)
+
+            let directAgentIdPrimary = try? container.decodeIfPresent(String.self, forKey: .agentId)
+            let directAgentIdSnake = try? container.decodeIfPresent(String.self, forKey: .agentIdSnake)
+            let directAgentId = directAgentIdPrimary ?? directAgentIdSnake
+
+            let directNicknamePrimary = try? container.decodeIfPresent(String.self, forKey: .agentNickname)
+            let directNicknameSnake = try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake)
+            let directNickname = directNicknamePrimary ?? directNicknameSnake
+
+            let directRolePrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+            let directRoleSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+            let directRoleType = try? container.decodeIfPresent(String.self, forKey: .agentType)
+            let directRoleTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+            let directRole = directRolePrimary ?? directRoleSnake ?? directRoleType ?? directRoleTypeSnake
+            agentId = Self.sanitized(directAgentId)
+                ?? Self.sanitized(source?.threadSpawn?.agentId)
+            agentNickname = Self.sanitized(directNickname)
+                ?? Self.sanitized(source?.threadSpawn?.agentNickname)
+            agentRole = Self.sanitized(directRole)
+                ?? Self.sanitized(source?.threadSpawn?.agentRole)
+        }
+
+        private static func sanitized(_ value: String?) -> String? {
+            guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+            return raw
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case model
+        case modelProvider
+        case modelProviderSnake = "model_provider"
+        case cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try container.decode(ThreadInfo.self, forKey: .thread)
+        model = try container.decode(String.self, forKey: .model)
+        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
+        cwd = try container.decode(String.self, forKey: .cwd)
     }
 }
 
@@ -105,7 +238,26 @@ struct ThreadStartResponse: Decodable {
 
 struct UserInput: Encodable {
     let type: String
-    let text: String
+    var text: String?
+    var path: String?
+    var name: String?
+    var imageURL: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case text
+        case path
+        case name
+        case imageURL = "image_url"
+    }
+
+    init(type: String, text: String? = nil, path: String? = nil, name: String? = nil, imageURL: String? = nil) {
+        self.type = type
+        self.text = text
+        self.path = path
+        self.name = name
+        self.imageURL = imageURL
+    }
 }
 
 struct TurnStartParams: Encodable {
@@ -121,6 +273,34 @@ struct TurnStartResponse: Decodable {
 
 struct TurnInterruptParams: Encodable {
     let threadId: String
+}
+
+// MARK: - Review
+
+struct ReviewStartParams: Encodable {
+    let threadId: String
+    let target: ReviewTarget
+    var delivery: String?
+}
+
+enum ReviewTarget: Encodable {
+    case uncommittedChanges
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .uncommittedChanges:
+            try container.encode("uncommittedChanges", forKey: .type)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+    }
+}
+
+struct ReviewStartResponse: Decodable {
+    let reviewThreadId: String?
 }
 
 // MARK: - Events (notifications from server)
@@ -174,6 +354,7 @@ struct ThreadListParams: Encodable {
     var cursor: String?
     var limit: Int?
     var sortKey: String?
+    var sourceKinds: [String]?
     var cwd: String?
     var archived: Bool?
 }
@@ -183,7 +364,7 @@ struct ThreadListResponse: Decodable {
     let nextCursor: String?
 }
 
-struct ThreadSummary: Identifiable {
+struct ThreadSummary: Decodable, Identifiable {
     let id: String
     let preview: String
     let modelProvider: String
@@ -191,22 +372,119 @@ struct ThreadSummary: Identifiable {
     let updatedAt: Int64
     let cwd: String
     let cliVersion: String
-}
+    let parentThreadId: String?
+    let rootThreadId: String?
+    let agentId: String?
+    let agentNickname: String?
+    let agentRole: String?
 
-extension ThreadSummary: Decodable {
     private enum CodingKeys: String, CodingKey {
-        case id, preview, modelProvider, createdAt, updatedAt, cwd, cliVersion
+        case id
+        case preview
+        case name
+        case modelProvider
+        case modelProviderSnake = "model_provider"
+        case createdAt
+        case createdAtSnake = "created_at"
+        case updatedAt
+        case updatedAtSnake = "updated_at"
+        case cwd
+        case cliVersion
+        case cliVersionSnake = "cli_version"
+        case parentThreadId
+        case parentThreadIdSnake = "parent_thread_id"
+        case forkedFromId
+        case forkedFromIdSnake = "forked_from_id"
+        case rootThreadId
+        case rootThreadIdSnake = "root_thread_id"
+        case agentId
+        case agentIdSnake = "agent_id"
+        case agentNickname
+        case agentNicknameSnake = "agent_nickname"
+        case agentRole
+        case agentRoleSnake = "agent_role"
+        case agentType
+        case agentTypeSnake = "agent_type"
+        case source
     }
 
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        preview = (try? c.decode(String.self, forKey: .preview)) ?? ""
-        modelProvider = (try? c.decode(String.self, forKey: .modelProvider)) ?? ""
-        createdAt = (try? c.decode(Int64.self, forKey: .createdAt)) ?? 0
-        updatedAt = (try? c.decode(Int64.self, forKey: .updatedAt)) ?? 0
-        cwd = (try? c.decode(String.self, forKey: .cwd)) ?? ""
-        cliVersion = (try? c.decode(String.self, forKey: .cliVersion)) ?? ""
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        let previewValue = (try? container.decodeIfPresent(String.self, forKey: .preview)) ?? ""
+        let nameValue = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        preview = previewValue.isEmpty ? nameValue : previewValue
+        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
+            ?? ""
+        createdAt = (try? container.decodeIfPresent(Int64.self, forKey: .createdAt))
+            ?? (try? container.decodeIfPresent(Int64.self, forKey: .createdAtSnake))
+            ?? 0
+        updatedAt = (try? container.decodeIfPresent(Int64.self, forKey: .updatedAt))
+            ?? (try? container.decodeIfPresent(Int64.self, forKey: .updatedAtSnake))
+            ?? 0
+        cwd = (try? container.decodeIfPresent(String.self, forKey: .cwd)) ?? ""
+        cliVersion = (try? container.decodeIfPresent(String.self, forKey: .cliVersion))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .cliVersionSnake))
+            ?? ""
+        let parentFromPrimary = try? container.decodeIfPresent(String.self, forKey: .parentThreadId)
+        let parentFromSnake = try? container.decodeIfPresent(String.self, forKey: .parentThreadIdSnake)
+        let parentFromForkCamel = try? container.decodeIfPresent(String.self, forKey: .forkedFromId)
+        let parentFromForkSnake = try? container.decodeIfPresent(String.self, forKey: .forkedFromIdSnake)
+        parentThreadId = parentFromPrimary ?? parentFromSnake ?? parentFromForkCamel ?? parentFromForkSnake
+
+        let rootFromPrimary = try? container.decodeIfPresent(String.self, forKey: .rootThreadId)
+        let rootFromSnake = try? container.decodeIfPresent(String.self, forKey: .rootThreadIdSnake)
+        rootThreadId = rootFromPrimary ?? rootFromSnake
+
+        let sourceAny = try? container.decodeIfPresent(AnyCodable.self, forKey: .source)
+        let directAgentIdPrimary = try? container.decodeIfPresent(String.self, forKey: .agentId)
+        let directAgentIdSnake = try? container.decodeIfPresent(String.self, forKey: .agentIdSnake)
+        let directAgentId = directAgentIdPrimary ?? directAgentIdSnake
+        let directNicknamePrimary = try? container.decodeIfPresent(String.self, forKey: .agentNickname)
+        let directNicknameSnake = try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake)
+        let directNickname = directNicknamePrimary ?? directNicknameSnake
+
+        let directRolePrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+        let directRoleSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+        let directRoleType = try? container.decodeIfPresent(String.self, forKey: .agentType)
+        let directRoleTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+        let directRole = directRolePrimary ?? directRoleSnake ?? directRoleType ?? directRoleTypeSnake
+
+        agentId = Self.sanitized(directAgentId)
+            ?? Self.sanitized(Self.extractThreadSpawnField(sourceAny?.value, keys: ["agent_id", "agentId"]))
+        agentNickname = Self.sanitized(directNickname)
+            ?? Self.sanitized(Self.extractThreadSpawnField(sourceAny?.value, keys: ["agent_nickname", "agentNickname"]))
+        agentRole = Self.sanitized(directRole)
+            ?? Self.sanitized(Self.extractThreadSpawnField(sourceAny?.value, keys: ["agent_role", "agentRole", "agent_type", "agentType"]))
+    }
+
+    fileprivate static func sanitized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    fileprivate static func extractThreadSpawnField(_ source: Any?, keys: [String]) -> String? {
+        guard let sourceDict = source as? [String: Any] else { return nil }
+        let subAgent = (sourceDict["subAgent"] as? [String: Any]) ?? (sourceDict["sub_agent"] as? [String: Any])
+        guard let subAgent else { return nil }
+        let threadSpawn = (subAgent["thread_spawn"] as? [String: Any]) ?? (subAgent["threadSpawn"] as? [String: Any])
+        let containers: [[String: Any]] = [threadSpawn, subAgent].compactMap { $0 }
+        guard !containers.isEmpty else { return nil }
+        for dict in containers {
+            for key in keys {
+                if let value = dict[key] as? String {
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        return trimmed
+                    }
+                } else if let value = dict[key] as? NSNumber {
+                    return value.stringValue
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -222,22 +500,155 @@ struct ThreadResumeParams: Encodable {
 struct ThreadResumeResponse: Decodable {
     let thread: ResumedThread
     let model: String
+    let modelProvider: String?
     let cwd: String
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case model
+        case modelProvider
+        case modelProviderSnake = "model_provider"
+        case cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try container.decode(ResumedThread.self, forKey: .thread)
+        model = try container.decode(String.self, forKey: .model)
+        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
+        cwd = try container.decode(String.self, forKey: .cwd)
+    }
 }
+
+struct ThreadForkParams: Encodable {
+    let threadId: String
+    var cwd: String?
+    var approvalPolicy: String?
+    var sandbox: String?
+}
+
+struct ThreadForkResponse: Decodable {
+    let thread: ResumedThread
+    let model: String
+    let modelProvider: String?
+    let cwd: String
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case model
+        case modelProvider
+        case modelProviderSnake = "model_provider"
+        case cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try container.decode(ResumedThread.self, forKey: .thread)
+        model = try container.decode(String.self, forKey: .model)
+        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
+        cwd = try container.decode(String.self, forKey: .cwd)
+    }
+}
+
+struct ThreadRollbackParams: Encodable {
+    let threadId: String
+    let numTurns: Int
+}
+
+struct ThreadRollbackResponse: Decodable {
+    let thread: ResumedThread
+    let cwd: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try container.decode(ResumedThread.self, forKey: .thread)
+        cwd = try? container.decodeIfPresent(String.self, forKey: .cwd)
+    }
+}
+
+struct ThreadSetNameParams: Encodable {
+    let threadId: String
+    let name: String
+}
+
+struct ThreadSetNameResponse: Decodable {}
+
+struct ThreadArchiveParams: Encodable {
+    let threadId: String
+}
+
+struct ThreadArchiveResponse: Decodable {}
 
 struct ResumedThread: Decodable {
     let id: String
     let turns: [ResumedTurn]
+    let parentThreadId: String?
+    let rootThreadId: String?
+    let agentId: String?
+    let agentNickname: String?
+    let agentRole: String?
 
     private enum CodingKeys: String, CodingKey {
         case id
         case turns
         case items
+        case parentThreadId
+        case parentThreadIdSnake = "parent_thread_id"
+        case forkedFromId
+        case forkedFromIdSnake = "forked_from_id"
+        case rootThreadId
+        case rootThreadIdSnake = "root_thread_id"
+        case agentId
+        case agentIdSnake = "agent_id"
+        case agentNickname
+        case agentNicknameSnake = "agent_nickname"
+        case agentRole
+        case agentRoleSnake = "agent_role"
+        case agentType
+        case agentTypeSnake = "agent_type"
+        case source
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
+        let parentFromPrimary = try? container.decodeIfPresent(String.self, forKey: .parentThreadId)
+        let parentFromSnake = try? container.decodeIfPresent(String.self, forKey: .parentThreadIdSnake)
+        let parentFromForkCamel = try? container.decodeIfPresent(String.self, forKey: .forkedFromId)
+        let parentFromForkSnake = try? container.decodeIfPresent(String.self, forKey: .forkedFromIdSnake)
+        parentThreadId = parentFromPrimary ?? parentFromSnake ?? parentFromForkCamel ?? parentFromForkSnake
+
+        let rootFromPrimary = try? container.decodeIfPresent(String.self, forKey: .rootThreadId)
+        let rootFromSnake = try? container.decodeIfPresent(String.self, forKey: .rootThreadIdSnake)
+        rootThreadId = rootFromPrimary ?? rootFromSnake
+
+        let sourceAny = try? container.decodeIfPresent(AnyCodable.self, forKey: .source)
+        let directAgentIdPrimary = try? container.decodeIfPresent(String.self, forKey: .agentId)
+        let directAgentIdSnake = try? container.decodeIfPresent(String.self, forKey: .agentIdSnake)
+        let directAgentId = directAgentIdPrimary ?? directAgentIdSnake
+        let directNicknamePrimary = try? container.decodeIfPresent(String.self, forKey: .agentNickname)
+        let directNicknameSnake = try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake)
+        let directNickname = directNicknamePrimary ?? directNicknameSnake
+
+        let directRolePrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+        let directRoleSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+        let directRoleType = try? container.decodeIfPresent(String.self, forKey: .agentType)
+        let directRoleTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+        let directRole = directRolePrimary ?? directRoleSnake ?? directRoleType ?? directRoleTypeSnake
+
+        agentId = ThreadSummary.sanitized(directAgentId)
+            ?? ThreadSummary.sanitized(ThreadSummary.extractThreadSpawnField(sourceAny?.value, keys: ["agent_id", "agentId"]))
+        agentNickname = ThreadSummary.sanitized(directNickname)
+            ?? ThreadSummary.sanitized(ThreadSummary.extractThreadSpawnField(sourceAny?.value, keys: ["agent_nickname", "agentNickname"]))
+        agentRole = ThreadSummary.sanitized(directRole)
+            ?? ThreadSummary.sanitized(ThreadSummary.extractThreadSpawnField(sourceAny?.value, keys: ["agent_role", "agentRole", "agent_type", "agentType"]))
         if let decodedTurns = try? container.decodeIfPresent([ResumedTurn].self, forKey: .turns) {
             turns = decodedTurns
         } else if let flatItems = try? container.decodeIfPresent([ResumedThreadItem].self, forKey: .items),
@@ -272,7 +683,7 @@ struct ResumedTurn: Decodable {
 
 enum ResumedThreadItem: Decodable {
     case userMessage([ResumedUserInput])
-    case agentMessage(text: String, phase: String?)
+    case agentMessage(text: String, phase: String?, agentId: String?, agentNickname: String?, agentRole: String?)
     case plan(String)
     case reasoning(summary: [String], content: [String])
     case commandExecution(
@@ -296,6 +707,7 @@ enum ResumedThreadItem: Decodable {
         tool: String,
         status: String,
         receiverThreadIds: [String],
+        receiverAgents: [ResumedCollabAgentRef],
         prompt: String?
     )
     case webSearch(query: String, action: AnyCodable?)
@@ -308,6 +720,7 @@ enum ResumedThreadItem: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case type
+        case id
         case content
         case text
         case phase
@@ -325,16 +738,32 @@ enum ResumedThreadItem: Decodable {
         case result
         case error
         case receiverThreadIds
+        case receiverThreadIdsSnake = "receiver_thread_ids"
+        case receiverAgents
+        case receiverAgentsSnake = "receiver_agents"
         case prompt
         case query
         case action
         case path
         case review
+        case source
+        case agentId
+        case agentIdSnake = "agent_id"
+        case agentNickname
+        case agentNicknameSnake = "agent_nickname"
+        case nickname
+        case name
+        case agentRole
+        case agentRoleSnake = "agent_role"
+        case agentType
+        case agentTypeSnake = "agent_type"
+        case role
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let type = (try? container.decode(String.self, forKey: .type)) ?? ""
+        let rawType = (try? container.decode(String.self, forKey: .type)) ?? ""
+        let type = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
         switch type {
         case "userMessage":
             var content = (try? container.decodeIfPresent([ResumedUserInput].self, forKey: .content)) ?? []
@@ -343,9 +772,43 @@ enum ResumedThreadItem: Decodable {
             }
             self = .userMessage(content)
         case "agentMessage", "assistantMessage":
+            let sourceAny = try? container.decodeIfPresent(AnyCodable.self, forKey: .source)
+            let directAgentId = Self.decodeString(container, forKey: .agentId)
+                ?? Self.decodeString(container, forKey: .agentIdSnake)
+                ?? Self.decodeString(container, forKey: .id)
+            let directNickname = Self.decodeString(container, forKey: .agentNickname)
+                ?? Self.decodeString(container, forKey: .agentNicknameSnake)
+                ?? Self.decodeString(container, forKey: .nickname)
+                ?? Self.decodeString(container, forKey: .name)
+            let directRole = Self.decodeString(container, forKey: .agentRole)
+                ?? Self.decodeString(container, forKey: .agentRoleSnake)
+                ?? Self.decodeString(container, forKey: .agentType)
+                ?? Self.decodeString(container, forKey: .agentTypeSnake)
+                ?? Self.decodeString(container, forKey: .role)
             self = .agentMessage(
                 text: Self.decodeString(container, forKey: .text) ?? "",
-                phase: Self.decodeString(container, forKey: .phase)
+                phase: Self.decodeString(container, forKey: .phase),
+                agentId: ThreadSummary.sanitized(directAgentId)
+                    ?? ThreadSummary.sanitized(
+                        ThreadSummary.extractThreadSpawnField(
+                            sourceAny?.value,
+                            keys: ["agent_id", "agentId", "id"]
+                        )
+                    ),
+                agentNickname: ThreadSummary.sanitized(directNickname)
+                    ?? ThreadSummary.sanitized(
+                        ThreadSummary.extractThreadSpawnField(
+                            sourceAny?.value,
+                            keys: ["agent_nickname", "agentNickname", "nickname", "name"]
+                        )
+                    ),
+                agentRole: ThreadSummary.sanitized(directRole)
+                    ?? ThreadSummary.sanitized(
+                        ThreadSummary.extractThreadSpawnField(
+                            sourceAny?.value,
+                            keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"]
+                        )
+                    )
             )
         case "plan":
             self = .plan(Self.decodeString(container, forKey: .text) ?? "")
@@ -381,10 +844,14 @@ enum ResumedThreadItem: Decodable {
             self = .collabAgentToolCall(
                 tool: Self.decodeString(container, forKey: .tool) ?? "",
                 status: Self.decodeString(container, forKey: .status) ?? "unknown",
-                receiverThreadIds: Self.decodeStringArray(container, forKey: .receiverThreadIds),
+                receiverThreadIds: Self.decodeStringArray(container, forKey: .receiverThreadIds)
+                    + Self.decodeStringArray(container, forKey: .receiverThreadIdsSnake),
+                receiverAgents: (try? container.decodeIfPresent([ResumedCollabAgentRef].self, forKey: .receiverAgents))
+                    ?? (try? container.decodeIfPresent([ResumedCollabAgentRef].self, forKey: .receiverAgentsSnake))
+                    ?? [],
                 prompt: Self.decodeString(container, forKey: .prompt)
             )
-        case "webSearch":
+        case "webSearch", "web_search", "web-search", "websearch":
             self = .webSearch(
                 query: Self.decodeString(container, forKey: .query) ?? "",
                 action: try? container.decodeIfPresent(AnyCodable.self, forKey: .action)
@@ -495,6 +962,77 @@ enum ResumedThreadItem: Decodable {
     }
 }
 
+struct ResumedCollabAgentRef: Decodable {
+    let threadId: String
+    let agentId: String?
+    let agentNickname: String?
+    let agentRole: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case source
+        case threadId
+        case threadIdSnake = "thread_id"
+        case agentId
+        case agentIdSnake = "agent_id"
+        case agentNickname
+        case agentNicknameSnake = "agent_nickname"
+        case nickname
+        case name
+        case agentRole
+        case agentRoleSnake = "agent_role"
+        case agentType
+        case agentTypeSnake = "agent_type"
+        case role
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sourceAny = try? container.decodeIfPresent(AnyCodable.self, forKey: .source)
+        let fallbackStringId = (try? container.decodeIfPresent(String.self, forKey: .id)) ?? nil
+        let fallbackIntId = (try? container.decodeIfPresent(Int.self, forKey: .id)) ?? nil
+        let fallbackId = ThreadSummary.sanitized(fallbackStringId) ?? fallbackIntId.map(String.init)
+        let threadIdFromSource = ThreadSummary.extractThreadSpawnField(
+            sourceAny?.value,
+            keys: ["thread_id", "threadId"]
+        )
+        threadId = ThreadSummary.sanitized((try? container.decodeIfPresent(String.self, forKey: .threadId))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .threadIdSnake))
+            ?? threadIdFromSource
+            ?? fallbackId) ?? ""
+        let agentIdPrimary = try? container.decodeIfPresent(String.self, forKey: .agentId)
+        let agentIdSnake = try? container.decodeIfPresent(String.self, forKey: .agentIdSnake)
+        let agentIdFromSource = ThreadSummary.extractThreadSpawnField(
+            sourceAny?.value,
+            keys: ["agent_id", "agentId", "id"]
+        )
+        let agentIdValue = agentIdPrimary ?? agentIdSnake ?? agentIdFromSource ?? fallbackId
+        let nicknamePrimary = try? container.decodeIfPresent(String.self, forKey: .agentNickname)
+        let nicknameSnake = try? container.decodeIfPresent(String.self, forKey: .agentNicknameSnake)
+        let nicknameGeneric = try? container.decodeIfPresent(String.self, forKey: .nickname)
+        let nameGeneric = try? container.decodeIfPresent(String.self, forKey: .name)
+        let nicknameFromSource = ThreadSummary.extractThreadSpawnField(
+            sourceAny?.value,
+            keys: ["agent_nickname", "agentNickname", "nickname", "name"]
+        )
+        let nickname = nicknamePrimary ?? nicknameSnake ?? nicknameGeneric ?? nameGeneric ?? nicknameFromSource
+
+        let rolePrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
+        let roleSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
+        let roleType = try? container.decodeIfPresent(String.self, forKey: .agentType)
+        let roleTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
+        let roleGeneric = try? container.decodeIfPresent(String.self, forKey: .role)
+        let roleFromSource = ThreadSummary.extractThreadSpawnField(
+            sourceAny?.value,
+            keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"]
+        )
+        let role = rolePrimary ?? roleSnake ?? roleType ?? roleTypeSnake ?? roleGeneric ?? roleFromSource
+        agentId = ThreadSummary.sanitized(agentIdValue)
+        agentNickname = ThreadSummary.sanitized(nickname)
+        agentRole = ThreadSummary.sanitized(role)
+    }
+}
+
 struct ResumedUserInput: Decodable {
     let type: String
     let text: String?
@@ -537,13 +1075,26 @@ struct ResumedFileUpdateChange: Decodable {
         case path
         case kind
         case diff
+        case unifiedDiff = "unified_diff"
+    }
+
+    private struct FileChangeKindObject: Decodable {
+        let type: String?
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         path = (try? container.decodeIfPresent(String.self, forKey: .path)) ?? "unknown"
-        kind = (try? container.decodeIfPresent(String.self, forKey: .kind)) ?? "update"
-        diff = (try? container.decodeIfPresent(String.self, forKey: .diff)) ?? ""
+        if let kindString = try? container.decode(String.self, forKey: .kind) {
+            kind = kindString
+        } else if let kindObject = try? container.decode(FileChangeKindObject.self, forKey: .kind) {
+            kind = kindObject.type ?? "update"
+        } else {
+            kind = "update"
+        }
+        diff = (try? container.decodeIfPresent(String.self, forKey: .diff))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .unifiedDiff))
+            ?? ""
     }
 }
 
@@ -588,6 +1139,265 @@ struct CommandExecResponse: Decodable {
     let exitCode: Int32
     let stdout: String
     let stderr: String
+}
+
+// MARK: - Config
+
+struct ConfigReadParams: Encodable {
+    let includeLayers: Bool
+    var cwd: String?
+}
+
+struct ConfigReadResponse: Decodable {
+    let config: AnyCodable
+}
+
+struct ConfigValueWriteParams<Value: Encodable>: Encodable {
+    let keyPath: String
+    let value: Value
+    let mergeStrategy: String
+    var filePath: String?
+    var expectedVersion: String?
+}
+
+struct ConfigWriteResponse: Decodable {
+    let status: String
+    let version: String
+    let filePath: String
+}
+
+// MARK: - Experimental Features
+
+struct ExperimentalFeatureListParams: Encodable {
+    var cursor: String?
+    var limit: Int?
+}
+
+struct ExperimentalFeatureListResponse: Decodable {
+    let data: [ExperimentalFeature]
+    let nextCursor: String?
+}
+
+struct ExperimentalFeature: Decodable, Identifiable {
+    let name: String
+    let stage: String
+    let displayName: String?
+    let description: String?
+    let announcement: String?
+    let enabled: Bool
+    let defaultEnabled: Bool
+
+    var id: String { name }
+}
+
+// MARK: - Skills
+
+struct SkillsListParams: Encodable {
+    var cwds: [String]?
+    var forceReload: Bool?
+}
+
+struct SkillsListResponse: Decodable {
+    let data: [SkillsListEntry]
+
+    private enum CodingKeys: String, CodingKey { case data }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var entries: [SkillsListEntry] = []
+        if var arr = try? c.nestedUnkeyedContainer(forKey: .data) {
+            while !arr.isAtEnd {
+                if let entry = try? arr.decode(SkillsListEntry.self) {
+                    entries.append(entry)
+                } else { _ = try? arr.decode(AnyCodable.self) }
+            }
+        }
+        data = entries
+    }
+}
+
+struct SkillsListEntry: Decodable {
+    let cwd: String
+    let errors: [SkillErrorInfo]
+    let skills: [SkillMetadata]
+
+    private enum CodingKeys: String, CodingKey { case cwd, errors, skills }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cwd = (try? c.decode(String.self, forKey: .cwd)) ?? ""
+        errors = (try? c.decode([SkillErrorInfo].self, forKey: .errors)) ?? []
+        skills = (try? c.decode([SkillMetadata].self, forKey: .skills)) ?? []
+    }
+}
+
+struct SkillErrorInfo: Decodable {
+    let path: String
+    let message: String
+}
+
+struct SkillMetadata: Decodable, Identifiable {
+    let name: String
+    let path: String
+    let description: String
+    let enabled: Bool
+    let scope: SkillScope
+    let interface: SkillInterface?
+    let shortDescription: String?
+    var provider: String = ""
+    var serverId: String = ""
+
+    var id: String {
+        let normalizedPath = Self.compactInlineText(path)
+        if !normalizedPath.isEmpty {
+            return "\(serverId):\(normalizedPath)"
+        }
+        let fallback = "\(displayName)|\(scope.rawValue)|\(summary)"
+        return "\(serverId):\(fallback.lowercased())"
+    }
+
+    var displayName: String {
+        let primary = Self.compactInlineText(interface?.displayName ?? name)
+        if !primary.isEmpty {
+            return primary
+        }
+        let pathName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        let fallback = Self.compactInlineText(pathName)
+        return fallback.isEmpty ? "Unnamed skill" : fallback
+    }
+
+    var summary: String {
+        Self.compactInlineText(interface?.shortDescription ?? shortDescription ?? description)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, path, description, enabled, scope, interface, shortDescription
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        path = (try? c.decode(String.self, forKey: .path)) ?? ""
+        description = (try? c.decode(String.self, forKey: .description)) ?? ""
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
+        scope = (try? c.decode(SkillScope.self, forKey: .scope)) ?? .user
+        interface = try? c.decodeIfPresent(SkillInterface.self, forKey: .interface)
+        shortDescription = try? c.decodeIfPresent(String.self, forKey: .shortDescription)
+    }
+
+    /// Create a stub entry for a Claude skill read from config files.
+    static func claudeStub(
+        name: String,
+        description: String,
+        path: String,
+        provider: String,
+        serverId: String,
+        userInvocable: Bool,
+        disableModelInvocation: Bool
+    ) -> SkillMetadata {
+        let normalizedPath = path.lowercased()
+        let userScopedPrefixes = [
+            "/.claude/skills/",
+            "/.claude/commands/",
+            "/.codex/skills/",
+            "/.codex/commands/",
+            "/.agents/skills/",
+            "/.agents/commands/"
+        ]
+        let scope: SkillScope = userScopedPrefixes.contains { normalizedPath.contains($0) } ? .user : .repo
+
+        return SkillMetadata(
+            name: name,
+            path: path,
+            description: description,
+            enabled: userInvocable && !disableModelInvocation,
+            scope: scope,
+            interface: SkillInterface(displayName: name, shortDescription: description.isEmpty ? nil : description, brandColor: nil, iconSmall: nil, defaultPrompt: nil),
+            shortDescription: description.isEmpty ? nil : description,
+            provider: provider,
+            serverId: serverId
+        )
+    }
+
+    private init(name: String, path: String, description: String, enabled: Bool, scope: SkillScope, interface: SkillInterface?, shortDescription: String?, provider: String, serverId: String) {
+        self.name = name
+        self.path = path
+        self.description = description
+        self.enabled = enabled
+        self.scope = scope
+        self.interface = interface
+        self.shortDescription = shortDescription
+        self.provider = provider
+        self.serverId = serverId
+    }
+
+    private static func compactInlineText(_ text: String) -> String {
+        text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+}
+
+enum SkillScope: String, Decodable {
+    case user, repo, system, admin
+}
+
+struct SkillInterface: Decodable {
+    let displayName: String?
+    let shortDescription: String?
+    let brandColor: String?
+    let iconSmall: String?
+    let defaultPrompt: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case displayName, shortDescription, brandColor, iconSmall, defaultPrompt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        displayName = try? c.decodeIfPresent(String.self, forKey: .displayName)
+        shortDescription = try? c.decodeIfPresent(String.self, forKey: .shortDescription)
+        brandColor = try? c.decodeIfPresent(String.self, forKey: .brandColor)
+        iconSmall = try? c.decodeIfPresent(String.self, forKey: .iconSmall)
+        defaultPrompt = try? c.decodeIfPresent(String.self, forKey: .defaultPrompt)
+    }
+
+    init(displayName: String?, shortDescription: String?, brandColor: String?, iconSmall: String?, defaultPrompt: String?) {
+        self.displayName = displayName
+        self.shortDescription = shortDescription
+        self.brandColor = brandColor
+        self.iconSmall = iconSmall
+        self.defaultPrompt = defaultPrompt
+    }
+}
+
+// MARK: - Fuzzy File Search
+
+struct FuzzyFileSearchParams: Encodable {
+    let query: String
+    let roots: [String]
+    var cancellationToken: String?
+}
+
+struct FuzzyFileSearchResponse: Decodable {
+    let files: [FuzzyFileSearchResult]
+}
+
+struct FuzzyFileSearchResult: Decodable, Identifiable {
+    let root: String
+    let path: String
+    let fileName: String
+    let score: Int
+    let indices: [Int]?
+
+    private enum CodingKeys: String, CodingKey {
+        case root
+        case path
+        case fileName = "file_name"
+        case score
+        case indices
+    }
+
+    var id: String { path }
 }
 
 // MARK: - Helpers
@@ -657,30 +1467,9 @@ struct ModelListParams: Encodable {
 struct ModelListResponse: Decodable {
     let data: [CodexModel]
     let nextCursor: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case data, nextCursor
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        // Decode models individually so one bad entry doesn't kill the whole list
-        var models: [CodexModel] = []
-        if var arr = try? c.nestedUnkeyedContainer(forKey: .data) {
-            while !arr.isAtEnd {
-                if let model = try? arr.decode(CodexModel.self) {
-                    models.append(model)
-                } else {
-                    _ = try? arr.decode(AnyCodable.self) // skip bad entry
-                }
-            }
-        }
-        data = models
-        nextCursor = try? c.decodeIfPresent(String.self, forKey: .nextCursor)
-    }
 }
 
-struct CodexModel: Identifiable {
+struct CodexModel: Decodable, Identifiable {
     let id: String
     let model: String
     let upgrade: String?
@@ -692,33 +1481,6 @@ struct CodexModel: Identifiable {
     let inputModalities: [String]?
     let supportsPersonality: Bool?
     let isDefault: Bool
-
-    var provider: String {
-        (id.hasPrefix("claude") || model.hasPrefix("claude")) ? "anthropic" : "openai"
-    }
-}
-
-extension CodexModel: Decodable {
-    private enum CodingKeys: String, CodingKey {
-        case id, model, upgrade, displayName, description, hidden
-        case supportedReasoningEfforts, defaultReasoningEffort
-        case inputModalities, supportsPersonality, isDefault
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        model = (try? c.decode(String.self, forKey: .model)) ?? id
-        upgrade = try? c.decodeIfPresent(String.self, forKey: .upgrade)
-        displayName = (try? c.decode(String.self, forKey: .displayName)) ?? id
-        description = (try? c.decode(String.self, forKey: .description)) ?? ""
-        hidden = (try? c.decode(Bool.self, forKey: .hidden)) ?? false
-        supportedReasoningEfforts = (try? c.decode([ReasoningEffortOption].self, forKey: .supportedReasoningEfforts)) ?? []
-        defaultReasoningEffort = (try? c.decode(String.self, forKey: .defaultReasoningEffort)) ?? ""
-        inputModalities = try? c.decodeIfPresent([String].self, forKey: .inputModalities)
-        supportsPersonality = try? c.decodeIfPresent(Bool.self, forKey: .supportsPersonality)
-        isDefault = (try? c.decode(Bool.self, forKey: .isDefault)) ?? false
-    }
 }
 
 struct ReasoningEffortOption: Decodable, Identifiable {
@@ -759,7 +1521,7 @@ struct GetAccountResponse: Decodable {
     let requiresOpenaiAuth: Bool
 
     struct AccountInfo: Decodable {
-        let type: String       // "apiKey" | "chatgpt" | "claude"
+        let type: String       // "apiKey" | "chatgpt"
         let email: String?
         let planType: String?
     }
@@ -955,183 +1717,3 @@ struct McpServerOauthLoginResponse: Decodable {
 
 struct McpServerReloadParams: Encodable {}
 struct McpServerReloadResponse: Decodable {}
-
-// MARK: - Skills
-
-struct SkillsListParams: Encodable {
-    var cwds: [String]?
-    var forceReload: Bool?
-}
-
-struct SkillsListResponse: Decodable {
-    let data: [SkillsListEntry]
-
-    private enum CodingKeys: String, CodingKey { case data }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        var entries: [SkillsListEntry] = []
-        if var arr = try? c.nestedUnkeyedContainer(forKey: .data) {
-            while !arr.isAtEnd {
-                if let entry = try? arr.decode(SkillsListEntry.self) {
-                    entries.append(entry)
-                } else { _ = try? arr.decode(AnyCodable.self) }
-            }
-        }
-        data = entries
-    }
-}
-
-struct SkillsListEntry: Decodable {
-    let cwd: String
-    let errors: [SkillErrorInfo]
-    let skills: [SkillMetadata]
-
-    private enum CodingKeys: String, CodingKey { case cwd, errors, skills }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        cwd = (try? c.decode(String.self, forKey: .cwd)) ?? ""
-        errors = (try? c.decode([SkillErrorInfo].self, forKey: .errors)) ?? []
-        skills = (try? c.decode([SkillMetadata].self, forKey: .skills)) ?? []
-    }
-}
-
-struct SkillErrorInfo: Decodable {
-    let path: String
-    let message: String
-}
-
-struct SkillMetadata: Decodable, Identifiable {
-    let name: String
-    let path: String
-    let description: String
-    let enabled: Bool
-    let scope: SkillScope
-    let interface: SkillInterface?
-    let shortDescription: String?
-    var provider: String = ""
-    var serverId: String = ""
-
-    var id: String {
-        let normalizedPath = Self.compactInlineText(path)
-        if !normalizedPath.isEmpty {
-            return "\(serverId):\(normalizedPath)"
-        }
-        let fallback = "\(displayName)|\(scope.rawValue)|\(summary)"
-        return "\(serverId):\(fallback.lowercased())"
-    }
-
-    var displayName: String {
-        let primary = Self.compactInlineText(interface?.displayName ?? name)
-        if !primary.isEmpty {
-            return primary
-        }
-        let pathName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-        let fallback = Self.compactInlineText(pathName)
-        return fallback.isEmpty ? "Unnamed skill" : fallback
-    }
-
-    var summary: String {
-        Self.compactInlineText(interface?.shortDescription ?? shortDescription ?? description)
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case name, path, description, enabled, scope, interface, shortDescription
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        name = (try? c.decode(String.self, forKey: .name)) ?? ""
-        path = (try? c.decode(String.self, forKey: .path)) ?? ""
-        description = (try? c.decode(String.self, forKey: .description)) ?? ""
-        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
-        scope = (try? c.decode(SkillScope.self, forKey: .scope)) ?? .user
-        interface = try? c.decodeIfPresent(SkillInterface.self, forKey: .interface)
-        shortDescription = try? c.decodeIfPresent(String.self, forKey: .shortDescription)
-    }
-
-    /// Create a stub entry for a Claude skill read from config files.
-    static func claudeStub(
-        name: String,
-        description: String,
-        path: String,
-        provider: String,
-        serverId: String,
-        userInvocable: Bool,
-        disableModelInvocation: Bool
-    ) -> SkillMetadata {
-        let normalizedPath = path.lowercased()
-        let userScopedPrefixes = [
-            "/.claude/skills/",
-            "/.claude/commands/",
-            "/.codex/skills/",
-            "/.codex/commands/",
-            "/.agents/skills/",
-            "/.agents/commands/"
-        ]
-        let scope: SkillScope = userScopedPrefixes.contains { normalizedPath.contains($0) } ? .user : .repo
-
-        return SkillMetadata(
-            name: name,
-            path: path,
-            description: description,
-            enabled: userInvocable && !disableModelInvocation,
-            scope: scope,
-            interface: SkillInterface(displayName: name, shortDescription: description.isEmpty ? nil : description, brandColor: nil, iconSmall: nil, defaultPrompt: nil),
-            shortDescription: description.isEmpty ? nil : description,
-            provider: provider,
-            serverId: serverId
-        )
-    }
-
-    private init(name: String, path: String, description: String, enabled: Bool, scope: SkillScope, interface: SkillInterface?, shortDescription: String?, provider: String, serverId: String) {
-        self.name = name
-        self.path = path
-        self.description = description
-        self.enabled = enabled
-        self.scope = scope
-        self.interface = interface
-        self.shortDescription = shortDescription
-        self.provider = provider
-        self.serverId = serverId
-    }
-
-    private static func compactInlineText(_ text: String) -> String {
-        text
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-}
-
-enum SkillScope: String, Decodable {
-    case user, repo, system, admin
-}
-
-struct SkillInterface: Decodable {
-    let displayName: String?
-    let shortDescription: String?
-    let brandColor: String?
-    let iconSmall: String?
-    let defaultPrompt: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case displayName, shortDescription, brandColor, iconSmall, defaultPrompt
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        displayName = try? c.decodeIfPresent(String.self, forKey: .displayName)
-        shortDescription = try? c.decodeIfPresent(String.self, forKey: .shortDescription)
-        brandColor = try? c.decodeIfPresent(String.self, forKey: .brandColor)
-        iconSmall = try? c.decodeIfPresent(String.self, forKey: .iconSmall)
-        defaultPrompt = try? c.decodeIfPresent(String.self, forKey: .defaultPrompt)
-    }
-
-    init(displayName: String?, shortDescription: String?, brandColor: String?, iconSmall: String?, defaultPrompt: String?) {
-        self.displayName = displayName
-        self.shortDescription = shortDescription
-        self.brandColor = brandColor
-        self.iconSmall = iconSmall
-        self.defaultPrompt = defaultPrompt
-    }
-}

@@ -19,12 +19,25 @@ final class ThreadState: ObservableObject, Identifiable {
     @Published var preview: String = ""
     @Published var cwd: String = ""
     @Published var updatedAt: Date = Date()
+    @Published var parentThreadId: String? = nil
+    @Published var rootThreadId: String? = nil
+    @Published var agentId: String? = nil
+    @Published var agentNickname: String? = nil
+    @Published var agentRole: String? = nil
 
     var id: ThreadKey { key }
 
     var hasTurnActive: Bool {
         if case .thinking = status { return true }
         return false
+    }
+
+    var agentDisplayLabel: String? {
+        let nickname = agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let role = agentRole?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !nickname.isEmpty && !role.isEmpty { return "\(nickname) [\(role)]" }
+        if !nickname.isEmpty { return nickname }
+        return nil
     }
 
     init(serverId: String, threadId: String, serverName: String, serverSource: ServerSource) {

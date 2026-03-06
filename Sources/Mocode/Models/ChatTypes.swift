@@ -1,6 +1,6 @@
 import Foundation
 
-enum MessageRole {
+enum MessageRole: Equatable {
     case user
     case assistant
     case system
@@ -11,6 +11,9 @@ struct ChatMessage: Identifiable {
     let role: MessageRole
     var text: String
     var images: [ChatImage] = []
+    var agentId: String? = nil
+    var agentNickname: String? = nil
+    var agentRole: String? = nil
     let timestamp = Date()
 }
 

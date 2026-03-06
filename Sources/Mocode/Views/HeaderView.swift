@@ -25,6 +25,7 @@ struct ModelSelectorView: View {
             Text("Models")
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundColor(MocodeTheme.textPrimary)
+                .accessibilityIdentifier("modelSelectorTitle")
 
             if models.isEmpty {
                 Spacer()

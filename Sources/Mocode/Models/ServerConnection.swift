@@ -16,9 +16,6 @@ final class ServerConnection: ObservableObject, Identifiable {
         }
     }
 
-    private static let defaultSandboxMode = "workspace-write"
-    private static let fallbackSandboxMode = "danger-full-access"
-
     let id: String
     let server: DiscoveredServer
     let target: ConnectionTarget
@@ -58,6 +55,7 @@ final class ServerConnection: ObservableObject, Identifiable {
     func connect() async {
         guard !isConnected else { return }
         connectionPhase = "start"
+        await DebugLog.shared.log("connect start serverId=\(server.id) host=\(server.hostname) target=\(String(describing: target)) hint=\(server.backendHint.displayName)")
         do {
             switch target {
             case .local:
@@ -92,12 +90,14 @@ final class ServerConnection: ObservableObject, Identifiable {
             isConnected = true
             connectionPhase = "ready"
             NSLog("[SERVER_CONNECTION] connected %@ (%@)", server.id, serverType.displayName)
+            await DebugLog.shared.log("connect ready serverId=\(server.id) serverType=\(serverType.displayName) url=\(serverURL?.absoluteString ?? "nil")")
             Task { [weak self] in
                 await self?.checkAuth()
             }
         } catch {
             connectionPhase = "error: \(error.localizedDescription)"
             NSLog("[SERVER_CONNECTION] connect failed %@: %@", server.id, error.localizedDescription)
+            await DebugLog.shared.log("connect failed serverId=\(server.id) error=\(error.localizedDescription)")
         }
     }
 
@@ -113,60 +113,133 @@ final class ServerConnection: ObservableObject, Identifiable {
     // MARK: - RPC Methods
 
     func listThreads(cwd: String? = nil, cursor: String? = nil, limit: Int? = 20) async throws -> ThreadListResponse {
-        try await client.sendRequest(
+        let sourceKinds: [String]?
+        switch serverType {
+        case .codex:
+            sourceKinds = ["cli", "vscode", "appServer"]
+        case .claude, .unknown:
+            sourceKinds = nil
+        }
+        await DebugLog.shared.log("thread/list serverId=\(server.id) serverType=\(serverType.displayName) cwd=\(cwd ?? "nil") cursor=\(cursor ?? "nil") sourceKinds=\(sourceKinds?.joined(separator: ",") ?? "nil")")
+
+        return try await client.sendRequest(
             method: "thread/list",
-            params: ThreadListParams(cursor: cursor, limit: limit, sortKey: "updated_at", cwd: cwd),
+            params: ThreadListParams(
+                cursor: cursor,
+                limit: limit,
+                sortKey: "updated_at",
+                sourceKinds: sourceKinds,
+                cwd: cwd
+            ),
             responseType: ThreadListResponse.self
         )
     }
 
-    func startThread(cwd: String, model: String? = nil) async throws -> ThreadStartResponse {
-        do {
-            return try await startThread(cwd: cwd, model: model, sandbox: Self.defaultSandboxMode)
-        } catch {
-            guard shouldRetryWithoutLinuxSandbox(error) else { throw error }
-            return try await startThread(cwd: cwd, model: model, sandbox: Self.fallbackSandboxMode)
-        }
-    }
-
-    func resumeThread(threadId: String, cwd: String) async throws -> ThreadResumeResponse {
-        do {
-            return try await resumeThread(threadId: threadId, cwd: cwd, sandbox: Self.defaultSandboxMode)
-        } catch {
-            guard shouldRetryWithoutLinuxSandbox(error) else { throw error }
-            return try await resumeThread(threadId: threadId, cwd: cwd, sandbox: Self.fallbackSandboxMode)
-        }
-    }
-
-    private func startThread(cwd: String, model: String?, sandbox: String) async throws -> ThreadStartResponse {
-        try await client.sendRequest(
-            method: "thread/start",
-            params: ThreadStartParams(model: model, cwd: cwd, approvalPolicy: "never", sandbox: sandbox),
-            responseType: ThreadStartResponse.self
+    func startThread(
+        cwd: String,
+        model: String? = nil,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async throws -> ThreadStartResponse {
+        try await startThread(
+            cwd: cwd,
+            model: model,
+            approvalPolicy: approvalPolicy,
+            sandbox: sandboxMode
         )
     }
 
-    private func resumeThread(threadId: String, cwd: String, sandbox: String) async throws -> ThreadResumeResponse {
+    func resumeThread(
+        threadId: String,
+        cwd: String,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async throws -> ThreadResumeResponse {
+        try await resumeThread(
+            threadId: threadId,
+            cwd: cwd,
+            approvalPolicy: approvalPolicy,
+            sandbox: sandboxMode
+        )
+    }
+
+    /// Lightweight state refresh that avoids mutating execution policy defaults.
+    func syncThreadState(
+        threadId: String,
+        cwd: String?
+    ) async throws -> ThreadResumeResponse {
         try await client.sendRequest(
             method: "thread/resume",
-            params: ThreadResumeParams(threadId: threadId, cwd: cwd, approvalPolicy: "never", sandbox: sandbox),
+            params: ThreadResumeParams(threadId: threadId, cwd: cwd, approvalPolicy: nil, sandbox: nil),
             responseType: ThreadResumeResponse.self
         )
     }
 
-    private func shouldRetryWithoutLinuxSandbox(_ error: Error) -> Bool {
-        guard case let JSONRPCClientError.serverError(_, message) = error else {
-            return false
-        }
-        let lower = message.lowercased()
-        return lower.contains("codex-linux-sandbox was required but not provided") ||
-            lower.contains("missing codex-linux-sandbox executable path")
+    func forkThread(
+        threadId: String,
+        cwd: String? = nil,
+        approvalPolicy: String? = nil,
+        sandboxMode: String? = nil
+    ) async throws -> ThreadForkResponse {
+        try await forkThread(
+            threadId: threadId,
+            cwd: cwd,
+            approvalPolicy: approvalPolicy,
+            sandbox: sandboxMode
+        )
     }
 
-    func sendTurn(threadId: String, text: String, model: String? = nil, effort: String? = nil) async throws {
+    private func startThread(
+        cwd: String,
+        model: String?,
+        approvalPolicy: String?,
+        sandbox: String?
+    ) async throws -> ThreadStartResponse {
+        try await client.sendRequest(
+            method: "thread/start",
+            params: ThreadStartParams(model: model, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox),
+            responseType: ThreadStartResponse.self
+        )
+    }
+
+    private func resumeThread(
+        threadId: String,
+        cwd: String,
+        approvalPolicy: String?,
+        sandbox: String?
+    ) async throws -> ThreadResumeResponse {
+        try await client.sendRequest(
+            method: "thread/resume",
+            params: ThreadResumeParams(threadId: threadId, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox),
+            responseType: ThreadResumeResponse.self
+        )
+    }
+
+    private func forkThread(
+        threadId: String,
+        cwd: String?,
+        approvalPolicy: String?,
+        sandbox: String?
+    ) async throws -> ThreadForkResponse {
+        try await client.sendRequest(
+            method: "thread/fork",
+            params: ThreadForkParams(threadId: threadId, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox),
+            responseType: ThreadForkResponse.self
+        )
+    }
+
+    func sendTurn(
+        threadId: String,
+        text: String,
+        model: String? = nil,
+        effort: String? = nil,
+        additionalInput: [UserInput] = []
+    ) async throws {
+        var inputs: [UserInput] = [UserInput(type: "text", text: text)]
+        inputs.append(contentsOf: additionalInput)
         let _: TurnStartResponse = try await client.sendRequest(
             method: "turn/start",
-            params: TurnStartParams(threadId: threadId, input: [UserInput(type: "text", text: text)], model: model, effort: effort),
+            params: TurnStartParams(threadId: threadId, input: inputs, model: model, effort: effort),
             responseType: TurnStartResponse.self
         )
     }
@@ -180,6 +253,22 @@ final class ServerConnection: ObservableObject, Identifiable {
         )
     }
 
+    func rollbackThread(threadId: String, numTurns: Int) async throws -> ThreadRollbackResponse {
+        try await client.sendRequest(
+            method: "thread/rollback",
+            params: ThreadRollbackParams(threadId: threadId, numTurns: numTurns),
+            responseType: ThreadRollbackResponse.self
+        )
+    }
+
+    func archiveThread(threadId: String) async throws {
+        let _: ThreadArchiveResponse = try await client.sendRequest(
+            method: "thread/archive",
+            params: ThreadArchiveParams(threadId: threadId),
+            responseType: ThreadArchiveResponse.self
+        )
+    }
+
     func listModels() async throws -> ModelListResponse {
         try await client.sendRequest(
             method: "model/list",
@@ -188,11 +277,19 @@ final class ServerConnection: ObservableObject, Identifiable {
         )
     }
 
-    func execCommand(_ command: [String], cwd: String? = nil) async throws -> CommandExecResponse {
+    func execCommand(_ command: [String], cwd: String? = nil, timeoutMs: Int? = nil) async throws -> CommandExecResponse {
         try await client.sendRequest(
             method: "command/exec",
-            params: CommandExecParams(command: command, cwd: cwd),
+            params: CommandExecParams(command: command, timeoutMs: timeoutMs, cwd: cwd),
             responseType: CommandExecResponse.self
+        )
+    }
+
+    func fuzzyFileSearch(query: String, roots: [String], cancellationToken: String? = nil) async throws -> FuzzyFileSearchResponse {
+        try await client.sendRequest(
+            method: "fuzzyFileSearch",
+            params: FuzzyFileSearchParams(query: query, roots: roots, cancellationToken: cancellationToken),
+            responseType: FuzzyFileSearchResponse.self
         )
     }
 
@@ -471,6 +568,7 @@ final class ServerConnection: ObservableObject, Identifiable {
             } else {
                 detectedType = .unknown
             }
+            await DebugLog.shared.log("initialize serverId=\(server.id) expected=\(server.backendHint.displayName) userAgent=\(response.userAgent) detected=\(detectedType.displayName)")
 
             // Always trust the actual server handshake over hints.
             if detectedType != .unknown {

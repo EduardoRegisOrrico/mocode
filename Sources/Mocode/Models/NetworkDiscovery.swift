@@ -13,17 +13,20 @@ private struct DiscoveryCandidate: Hashable {
 final class NetworkDiscovery: ObservableObject {
     @Published var servers: [DiscoveredServer] = []
     @Published var isScanning = false
+    @Published var scanError: String?
 
     private var scanTask: Task<Void, Never>?
     private var activeScanID = UUID()
 
-    func startScanning() {
+    func startScanning(apiKey: String) {
         stopScanning()
         let scanID = UUID()
         activeScanID = scanID
 
         servers = []
+        scanError = nil
         isScanning = true
+
         if OnDeviceCodexFeature.isEnabled {
             servers.append(DiscoveredServer(
                 id: "local",
@@ -36,8 +39,6 @@ final class NetworkDiscovery: ObservableObject {
         }
         #if targetEnvironment(simulator)
         if !OnDeviceCodexFeature.isEnabled {
-            // Simulator often cannot discover mDNS peers reliably. Always provide
-            // a direct SSH target to the host machine via loopback.
             servers.append(DiscoveredServer(
                 id: "simulator-host-loopback",
                 name: "This Mac (localhost)",
@@ -49,7 +50,7 @@ final class NetworkDiscovery: ObservableObject {
         }
         #endif
 
-        scanTask = Task { await discoverNetworkServers(scanID: scanID) }
+        scanTask = Task { await discoverTailscaleDevices(apiKey: apiKey, scanID: scanID) }
     }
 
     func stopScanning() {
@@ -58,9 +59,9 @@ final class NetworkDiscovery: ObservableObject {
         isScanning = false
     }
 
-    // MARK: - Discovery
+    // MARK: - Tailscale Cloud API Discovery
 
-    private func discoverNetworkServers(scanID: UUID) async {
+    private func discoverTailscaleDevices(apiKey: String, scanID: UUID) async {
         defer {
             if activeScanID == scanID {
                 isScanning = false
@@ -68,20 +69,18 @@ final class NetworkDiscovery: ObservableObject {
         }
         guard !Task.isCancelled else { return }
 
-        // In the remote-only app variant we still want to discover this Mac over SSH,
-        // so don't exclude local IPv4 unless on-device mode is enabled.
-        let excludedIPv4 = OnDeviceCodexFeature.isEnabled ? Self.localIPv4Address()?.0 : nil
-        async let bonjourCandidates = Self.discoverBonjourSSHCandidates(timeout: 3.0)
-        async let tailscaleCandidates = Self.discoverTailscaleSSHCandidates(timeout: 3.0)
-        let merged = Self.mergeCandidates(
-            Array((await bonjourCandidates) + (await tailscaleCandidates)),
-            excluding: excludedIPv4
-        )
-        let reachable = await Self.filterCandidatesWithOpenSSH(merged, timeout: 2.0)
-        let discovered = reachable.isEmpty ? merged : reachable
+        let candidates: [DiscoveryCandidate]
+        do {
+            candidates = try await Self.fetchTailscaleDevices(apiKey: apiKey)
+        } catch {
+            guard !Task.isCancelled, activeScanID == scanID else { return }
+            scanError = error.localizedDescription
+            return
+        }
+
         guard !Task.isCancelled, activeScanID == scanID else { return }
 
-        for candidate in discovered.sorted(by: Self.candidateSortOrder) {
+        for candidate in candidates.sorted(by: Self.candidateSortOrder) {
             let id = "\(candidate.source.rawString)-\(candidate.ip)"
             guard !servers.contains(where: { $0.id == id }) else { continue }
             servers.append(DiscoveredServer(
@@ -95,166 +94,65 @@ final class NetworkDiscovery: ObservableObject {
         }
     }
 
-    nonisolated private static func candidateSortOrder(lhs: DiscoveryCandidate, rhs: DiscoveryCandidate) -> Bool {
-        let leftRank = sourceRank(lhs.source)
-        let rightRank = sourceRank(rhs.source)
-        if leftRank != rightRank {
-            return leftRank < rightRank
+    nonisolated private static func fetchTailscaleDevices(apiKey: String) async throws -> [DiscoveryCandidate] {
+        guard let url = URL(string: "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=default") else {
+            throw URLError(.badURL)
         }
-        let leftName = lhs.name ?? lhs.ip
-        let rightName = rhs.name ?? rhs.ip
-        return leftName.localizedCaseInsensitiveCompare(rightName) == .orderedAscending
-    }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
 
-    nonisolated private static func sourceRank(_ source: ServerSource) -> Int {
-        switch source {
-        case .tailscale: return 0
-        case .bonjour: return 1
-        default: return 2
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
         }
-    }
-
-    nonisolated private static func mergeCandidates(
-        _ candidates: [DiscoveryCandidate],
-        excluding localIPv4: String?
-    ) -> [DiscoveryCandidate] {
-        var merged: [String: DiscoveryCandidate] = [:]
-        for candidate in candidates {
-            guard isIPv4Address(candidate.ip), candidate.ip != localIPv4 else { continue }
-            if let existing = merged[candidate.ip] {
-                if sourceRank(candidate.source) < sourceRank(existing.source) {
-                    merged[candidate.ip] = candidate
-                } else if existing.name == nil, candidate.name != nil {
-                    merged[candidate.ip] = candidate
-                } else if existing.sshHost == nil, candidate.sshHost != nil {
-                    merged[candidate.ip] = candidate
-                }
-            } else {
-                merged[candidate.ip] = candidate
-            }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw NSError(domain: "Tailscale", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid API key"])
         }
-        return Array(merged.values)
-    }
-
-    nonisolated private static func isPortOpen(host: String, port: UInt16, timeout: TimeInterval) async -> Bool {
-        await withCheckedContinuation { cont in
-            let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
-            let resumed = LockedFlag()
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if resumed.setTrue() {
-                        connection.cancel()
-                        cont.resume(returning: true)
-                    }
-                case .failed, .cancelled:
-                    if resumed.setTrue() {
-                        connection.cancel()
-                        cont.resume(returning: false)
-                    }
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .global(qos: .utility))
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                if resumed.setTrue() {
-                    connection.cancel()
-                    cont.resume(returning: false)
-                }
-            }
+        guard (200...299).contains(http.statusCode) else {
+            throw NSError(domain: "Tailscale", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Tailscale API error (\(http.statusCode))"])
         }
+
+        return parseTailscaleAPIResponse(data: data)
     }
 
-    nonisolated private static func filterCandidatesWithOpenSSH(
-        _ candidates: [DiscoveryCandidate],
-        timeout: TimeInterval
-    ) async -> [DiscoveryCandidate] {
-        await withTaskGroup(of: DiscoveryCandidate?.self) { group in
-            for candidate in candidates {
-                group.addTask {
-                    guard await isPortOpen(host: candidate.ip, port: 22, timeout: timeout) else {
-                        return nil
-                    }
-                    return candidate
-                }
-            }
-            var reachable: [DiscoveryCandidate] = []
-            for await candidate in group {
-                if let candidate {
-                    reachable.append(candidate)
-                }
-            }
-            return reachable
-        }
-    }
-
-    private static func discoverBonjourSSHCandidates(timeout: TimeInterval) async -> [DiscoveryCandidate] {
-        let browser = BonjourSSHDiscoverer()
-        return await browser.discover(timeout: timeout)
-    }
-
-    nonisolated private static func discoverTailscaleSSHCandidates(timeout: TimeInterval) async -> [DiscoveryCandidate] {
-        let urls = [
-            "http://100.100.100.100/localapi/v0/status",
-            "http://[fd7a:115c:a1e0::53]/localapi/v0/status"
-        ].compactMap(URL.init(string:))
-
-        var candidates: [DiscoveryCandidate] = []
-        for url in urls {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = timeout
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse,
-                      (200...299).contains(http.statusCode) else {
-                    continue
-                }
-                candidates.append(contentsOf: parseTailscaleStatus(data: data))
-                if !candidates.isEmpty {
-                    break
-                }
-            } catch {
-                continue
-            }
-        }
-        return candidates
-    }
-
-    nonisolated private static func parseTailscaleStatus(data: Data) -> [DiscoveryCandidate] {
+    nonisolated private static func parseTailscaleAPIResponse(data: Data) -> [DiscoveryCandidate] {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let peers = json["Peer"] as? [String: Any] else {
+              let devices = json["devices"] as? [[String: Any]] else {
             return []
         }
 
-        let magicDNSSuffix = cleanedDNSName(json["MagicDNSSuffix"] as? String)
         var candidates: [DiscoveryCandidate] = []
-        for peer in peers.values {
-            guard let peerDict = peer as? [String: Any] else { continue }
-            let hostName = cleanedHostName(peerDict["HostName"] as? String)
-            let dnsName = cleanedDNSName(peerDict["DNSName"] as? String)
-            let sshHost: String?
-            if let dnsName {
-                sshHost = dnsName
-            } else if let hostName, let magicDNSSuffix {
-                let label = normalizedDNSLabel(hostName)
-                sshHost = label.isEmpty ? nil : "\(label).\(magicDNSSuffix)"
-            } else {
-                sshHost = nil
-            }
-            let ips = (peerDict["TailscaleIPs"] as? [String]) ?? []
-            guard let ipv4 = ips.first(where: { isIPv4Address($0) }) else { continue }
+        for device in devices {
+            let hostname = device["hostname"] as? String
+            let name = device["name"] as? String  // MagicDNS FQDN
+            let addresses = (device["addresses"] as? [String]) ?? []
+
+            // Use the MagicDNS name (e.g. "mac.tail1234.ts.net") as sshHost
+            let sshHost = cleanedDNSName(name)
+            let displayName = cleanedHostName(hostname) ?? sshHost
+
+            guard let ipv4 = addresses.first(where: { isIPv4Address($0) }) else { continue }
             candidates.append(
                 DiscoveryCandidate(
                     ip: ipv4,
-                    name: hostName ?? sshHost,
+                    name: displayName,
                     source: .tailscale,
                     sshHost: sshHost
                 )
             )
         }
         return candidates
+    }
+
+    // MARK: - Helpers
+
+    nonisolated private static func candidateSortOrder(lhs: DiscoveryCandidate, rhs: DiscoveryCandidate) -> Bool {
+        let leftName = lhs.name ?? lhs.ip
+        let rightName = rhs.name ?? rhs.ip
+        return leftName.localizedCaseInsensitiveCompare(rightName) == .orderedAscending
     }
 
     nonisolated private static func cleanedHostName(_ value: String?) -> String? {
@@ -276,135 +174,10 @@ final class NetworkDiscovery: ObservableObject {
         return value.isEmpty ? nil : value.lowercased()
     }
 
-    nonisolated private static func normalizedDNSLabel(_ value: String) -> String {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
-        let chars = value.lowercased().unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
-        return String(chars)
-            .replacingOccurrences(of: "--", with: "-")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-    }
-
-    nonisolated fileprivate static func ipv4Address(fromSockaddrData data: Data) -> String? {
-        data.withUnsafeBytes { bytes in
-            guard let base = bytes.baseAddress else { return nil }
-            let sockaddrPtr = base.assumingMemoryBound(to: sockaddr.self)
-            guard sockaddrPtr.pointee.sa_family == sa_family_t(AF_INET) else { return nil }
-            let sinPtr = base.assumingMemoryBound(to: sockaddr_in.self)
-            var addr = sinPtr.pointee.sin_addr
-            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
-                return nil
-            }
-            return String(cString: buffer)
-        }
-    }
-
     nonisolated private static func isIPv4Address(_ value: String) -> Bool {
         var addr = in_addr()
         return value.withCString { cstr in
             inet_pton(AF_INET, cstr, &addr) == 1
         }
-    }
-
-    nonisolated private static func localIPv4Address() -> (String, String)? {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
-        defer { freeifaddrs(ifaddr) }
-
-        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
-            let flags = Int32(ptr.pointee.ifa_flags)
-            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
-            guard ptr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
-            let name = String(cString: ptr.pointee.ifa_name)
-            guard name.hasPrefix("en") else { continue }
-            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            ptr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                inet_ntop(AF_INET, &sin.pointee.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
-            }
-            return (String(cString: buf), name)
-        }
-        return nil
-    }
-}
-
-@MainActor
-private final class BonjourSSHDiscoverer: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
-    private let browser = NetServiceBrowser()
-    private var services: [NetService] = []
-    private var results: [String: String] = [:]
-    private var continuation: CheckedContinuation<[DiscoveryCandidate], Never>?
-    private var timeoutTask: Task<Void, Never>?
-    private var isFinished = false
-
-    func discover(timeout: TimeInterval) async -> [DiscoveryCandidate] {
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
-            browser.delegate = self
-            browser.searchForServices(ofType: "_ssh._tcp.", inDomain: "local.")
-            timeoutTask = Task { [weak self] in
-                guard let self else { return }
-                let nanos = UInt64(max(timeout, 0.25) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                await self.finish()
-            }
-        }
-    }
-
-    private func finish() {
-        guard !isFinished else { return }
-        isFinished = true
-        timeoutTask?.cancel()
-        timeoutTask = nil
-        browser.stop()
-        for service in services {
-            service.stop()
-            service.delegate = nil
-        }
-        let discovered = results.map {
-            DiscoveryCandidate(ip: $0.key, name: $0.value, source: .bonjour, sshHost: nil)
-        }
-        continuation?.resume(returning: discovered)
-        continuation = nil
-    }
-
-    func netServiceBrowserWillSearch(_ browser: NetServiceBrowser) {}
-
-    func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
-        finish()
-    }
-
-    func netServiceBrowserDidStopSearch(_ browser: NetServiceBrowser) {
-        finish()
-    }
-
-    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
-        services.append(service)
-        service.delegate = self
-        service.resolve(withTimeout: 1.0)
-    }
-
-    func netServiceDidResolveAddress(_ sender: NetService) {
-        guard let addresses = sender.addresses else { return }
-        for address in addresses {
-            guard let ip = NetworkDiscovery.ipv4Address(fromSockaddrData: address) else { continue }
-            results[ip] = sender.name
-            break
-        }
-    }
-
-    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {}
-}
-
-/// Thread-safe flag for one-shot continuation resumption.
-private final class LockedFlag: @unchecked Sendable {
-    private var value = false
-    private let lock = NSLock()
-    /// Returns `true` the first time it's called; `false` thereafter.
-    func setTrue() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if value { return false }
-        value = true
-        return true
     }
 }

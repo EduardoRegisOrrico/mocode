@@ -9,7 +9,11 @@ struct MocodeApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(serverManager)
-                .task { await serverManager.reconnectAll() }
+                .task {
+                    await DebugLog.shared.reset()
+                    await DebugLog.shared.log("app launch")
+                    await serverManager.reconnectAll()
+                }
         }
     }
 }
@@ -36,7 +40,20 @@ struct ContentView: View {
                 .tag(1)
         }
         .environmentObject(appState)
+        .task {
+            await liveSyncLoop()
+        }
         .enableInjection()
+    }
+
+    private func liveSyncLoop() async {
+        while !Task.isCancelled {
+            if serverManager.hasAnyConnection {
+                await serverManager.performLiveSyncPass()
+            }
+            let delay: Duration = serverManager.activeThreadKey == nil ? .seconds(5) : .seconds(2)
+            try? await Task.sleep(for: delay)
+        }
     }
 }
 
@@ -67,7 +84,11 @@ struct ChatTab: View {
                 Task {
                     if let thread = serverManager.threads[key] {
                         appState.currentCwd = thread.cwd
-                        await serverManager.viewThread(key)
+                        await serverManager.viewThread(
+                            key,
+                            approvalPolicy: appState.resolvedApprovalPolicy,
+                            sandboxMode: appState.resolvedSandboxMode
+                        )
                     }
                 }
             }
@@ -104,6 +125,7 @@ struct ChatTab: View {
 
 struct SettingsTab: View {
     @EnvironmentObject var serverManager: ServerManager
+    @EnvironmentObject var appState: AppState
     @State private var showAccount = false
     @State private var showMcpServers = false
 
@@ -216,6 +238,29 @@ struct SettingsTab: View {
                 } header: {
                     Text("Plugins")
                         .foregroundColor(MocodeTheme.textSecondary)
+                }
+
+                Section {
+                    Picker("Approval Policy", selection: $appState.approvalPolicy) {
+                        Text("Desktop Default").tag(AppState.desktopDefaultValue)
+                        Text("Never").tag("never")
+                        Text("On Request").tag("on-request")
+                        Text("On Failure").tag("on-failure")
+                        Text("Untrusted").tag("untrusted")
+                    }
+                    Picker("Sandbox", selection: $appState.sandboxMode) {
+                        Text("Desktop Default").tag(AppState.desktopDefaultValue)
+                        Text("Workspace Write").tag("workspace-write")
+                        Text("Read Only").tag("read-only")
+                        Text("Danger Full Access").tag("danger-full-access")
+                    }
+                } header: {
+                    Text("Execution Policy")
+                        .foregroundColor(MocodeTheme.textSecondary)
+                } footer: {
+                    Text("Applied to new/resumed/forked sessions and turn execution defaults.")
+                        .font(.system(.caption2, design: .rounded))
+                        .foregroundColor(MocodeTheme.textMuted)
                 }
 
                 Section {
