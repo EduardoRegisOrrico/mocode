@@ -1,16 +1,14 @@
 # mocode (codex-ios)
 
-<p align="center">
-  <img src="Sources/Mocode/Resources/brand_logo.png" alt="mocode logo" width="180" />
-</p>
-
-> **This project has been discontinued.** Advancements on Anthropic's side with Claude remote control have made this tool unnecessary. mocode was originally built for personal use as an iOS client for Codex in remote mode, and is no longer maintained.
+> **This project has been discontinued.** mocode was a fork of [litter](https://github.com/EduardoRegisOrrico/litter) adapted for use with Claude. Advancements on Anthropic's side with Claude remote control have made this tool unnecessary. It was originally built for personal use and is no longer maintained.
+>
+> For Codex mobile use, check out the original [litter](https://github.com/EduardoRegisOrrico/litter) app.
 
 ---
 
 ## What was mocode?
 
-`mocode` was an iOS client for Codex in remote mode. It allowed connecting to a remote Codex server from an iPhone or iPad, managing sessions, and interacting with the AI agent on the go.
+`mocode` was an iOS client for connecting to a remote Codex server from an iPhone or iPad, forked from litter and adapted to work with Claude. It allowed managing sessions and interacting with the AI agent on the go.
 
 ## Archive note
 
